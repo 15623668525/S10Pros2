@@ -91,7 +91,6 @@
                    box-shadow:0 2px 9px rgba(20,40,80,.15); pointer-events:none; white-space:nowrap;
                    transition:transform .07s linear, background .12s, color .12s; }
   .wheel.active .wthumb { background:var(--accent); color:#fff; }
-  .axislab { text-align:center; font-size:11px; color:var(--sub); margin-top:5px; line-height:1.45; }
   /* 按钮 */
   .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
   /* v2.5：运动控制 5 键同一行（站立/趴下/步态三档），急停移到卡片右上角 */
@@ -250,7 +249,6 @@
         <span class="wtick r">右 ▶</span>
         <div class="wthumb" id="wthumb">停</div>
       </div>
-      <div class="axislab" id="wheelTip">拖动圆盘：上/下=前进后退，左/右=原地转向，左上/右上=前进同时转向；拖回正上恢复直行，松手即停</div>
       <div class="btns five">
         <button onclick="stand()">站立</button>
         <button onclick="mstate(4)">趴下</button>
