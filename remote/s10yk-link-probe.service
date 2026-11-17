@@ -1,0 +1,7 @@
+[Unit]
+Description=S10YK robot link probe (ICMP+ARP to <ROBOT_IP>)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s10yk-link-probe.sh

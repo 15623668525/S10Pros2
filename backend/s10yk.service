@@ -1,0 +1,15 @@
+[Unit]
+Description=S10YK Remote Control Backend (S10 Pro)
+After=network-online.target localizations.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/S10ykRemove/app/backend
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec python3 /S10ykRemove/app/backend/app.py'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

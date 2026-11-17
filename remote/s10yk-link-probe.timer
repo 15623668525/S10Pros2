@@ -1,0 +1,11 @@
+[Unit]
+Description=Run S10YK robot link probe every 5s
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=s10yk-link-probe.service
+
+[Install]
+WantedBy=timers.target
