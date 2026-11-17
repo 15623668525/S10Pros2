@@ -70,27 +70,28 @@
   .statusgrid .vs { font-size:9.5px; color:var(--sub); font-weight:500; min-width:0;
                     overflow:hidden; text-overflow:ellipsis; }
   .k { color:var(--sub); }
-  /* 十字方向盘（v3.0：合并原「前后/左右」+「转向」双摇杆） */
-  /* REQ-030：容器不再 touch-action:none，避免手指落在方向盘网格（约200×200px）时页面无法上下滚动；
-     把禁止手势下沉到按键本身，且用 pan-y 允许纵向滚动（按住不动仍触发 pointerdown 发指令，
-     纵向滑动时不阻断页面滚动、由 pointercancel 自动松手） */
-  .dpad { display:grid; grid-template-columns:repeat(3,54px); grid-template-rows:repeat(3,54px);
-          gap:6px; justify-content:center; padding:7px 0 0; user-select:none; }
-  .dp { display:flex; align-items:center; justify-content:center; border-radius:17px;
-        border:1px solid var(--line); background:#eef1f5; color:#33415c;
-        font-size:23px; line-height:1; cursor:pointer; padding:0;
-        touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
-        transition:background .12s, color .12s, transform .08s;
-        -webkit-tap-highlight-color:transparent; }
-  .dp.on { background:var(--accent); border-color:var(--accent); color:#fff; transform:scale(.95); }
-  .dp.up    { grid-area:1/2; }
-  .dp.left  { grid-area:2/1; }
-  .dp.mid   { grid-area:2/2; font-size:18px; background:#f7f8fa; color:#93a0b4; }
-  .dp.right { grid-area:2/3; }
-  .dp.down  { grid-area:3/2; }
-  .dpad.dis .dp { background:#f2f4f7; color:#c3cbd7; border-color:#e7ebf1; pointer-events:none; }
-  .dpad.dis .dp.mid { background:#f8f9fb; }
-  .axislab { text-align:center; font-size:11px; color:var(--sub); margin-top:4px; }
+  /* REQ-044：圆形八向方向盘（取代原十字盘）。
+     上/下=前进/后退，左/右=原地转向，左上/右上=前进中转向；
+     拖动中不松手从斜向拖回正上即恢复直行，松手回中停止。
+     圆盘是连续拖动控件，touch-action:none 仅作用于这块 186px 区域，页面其余仍可正常滚动。 */
+  .wheel { position:relative; width:186px; height:186px; margin:8px auto 0; border-radius:50%;
+           border:2px solid var(--line); background:#eef1f5;
+           box-shadow:inset 0 2px 7px rgba(25,45,80,.07);
+           touch-action:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  .wheel.dis { background:#f4f6f9; border-color:#e7ebf1; pointer-events:none; }
+  .wheel .wring { position:absolute; inset:25px; border-radius:50%; border:1px dashed #d6dee9; pointer-events:none; }
+  .wheel .wtick { position:absolute; font-size:11px; font-weight:600; color:#93a0b4; pointer-events:none; }
+  .wheel .wtick.t { top:6px; left:50%; transform:translateX(-50%); }
+  .wheel .wtick.b { bottom:6px; left:50%; transform:translateX(-50%); }
+  .wheel .wtick.l { left:8px; top:50%; transform:translateY(-50%); }
+  .wheel .wtick.r { right:8px; top:50%; transform:translateY(-50%); }
+  .wheel .wthumb { position:absolute; left:50%; top:50%; width:58px; height:58px; margin:-29px 0 0 -29px;
+                   border-radius:50%; background:#fff; border:2px solid var(--accent); color:var(--accent);
+                   display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700;
+                   box-shadow:0 2px 9px rgba(20,40,80,.15); pointer-events:none; white-space:nowrap;
+                   transition:transform .07s linear, background .12s, color .12s; }
+  .wheel.active .wthumb { background:var(--accent); color:#fff; }
+  .axislab { text-align:center; font-size:11px; color:var(--sub); margin-top:5px; line-height:1.45; }
   /* 按钮 */
   .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
   /* v2.5：运动控制 5 键同一行（站立/趴下/步态三档），急停移到卡片右上角 */
@@ -240,14 +241,16 @@
           <button class="estoph" onclick="estop()">⛔ 急停</button>
         </div>
       </div>
-      <div class="dpad dis" id="dpad">
-        <button class="dp up"    data-dir="fwd">▲</button>
-        <button class="dp left"  data-dir="left">◀</button>
-        <button class="dp mid"   data-dir="stop">■</button>
-        <button class="dp right" data-dir="right">▶</button>
-        <button class="dp down"  data-dir="back">▼</button>
+      <!-- REQ-044：圆形八向方向盘。拖动 thumb 到斜向=前进中转向；拖回正上=恢复直行；松手=回中停止 -->
+      <div class="wheel dis" id="wheel">
+        <div class="wring"></div>
+        <span class="wtick t">前 ▲</span>
+        <span class="wtick b">▼ 后</span>
+        <span class="wtick l">◀ 左</span>
+        <span class="wtick r">右 ▶</span>
+        <div class="wthumb" id="wthumb">停</div>
       </div>
-      <div class="axislab">按住方向行走 · 松手即停（左/右=原地转向）</div>
+      <div class="axislab" id="wheelTip">拖动圆盘：上/下=前进后退，左/右=原地转向，左上/右上=前进同时转向；拖回正上恢复直行，松手即停</div>
       <div class="btns five">
         <button onclick="stand()">站立</button>
         <button onclick="mstate(4)">趴下</button>
@@ -390,8 +393,8 @@ function setSleep(v){
   b.classList.toggle("on", v);
   b.title = v ? "机器人休眠中（趴下+关节下电），点击唤醒（自动站立）"
               : "点击进入休眠（趴下并关节下电；厂商休眠还含关相机等，此处为协议等效通道）";
-  /* 休眠中禁止十字盘操作（速度使能也已被后端撤销），唤醒后按 ARMED 状态恢复 */
-  document.getElementById("dpad").classList.toggle("dis", v || !ARMED);
+  /* 休眠中禁止方向盘操作（速度使能也已被后端撤销），唤醒后按 ARMED 状态恢复 */
+  document.getElementById("wheel").classList.toggle("dis", v || !ARMED);
 }
 async function toggleArm(){ const r = await api("/api/arm",{armed:!ARMED}); setArm(r.armed); }
 function setArm(v){
@@ -400,8 +403,8 @@ function setArm(v){
   b.classList.toggle("on", v);
   b.title = v ? "速度控制已使能（点击关闭）" : "速度控制未使能（点击开启）";
   b.firstElementChild.textContent = v ? "🔓" : "🔒";
-  document.getElementById("dpad").classList.toggle("dis", !v || SLEEPING);   /* REQ-042：休眠中保持锁定 */
-  if (!v) dpadSet("stop");
+  document.getElementById("wheel").classList.toggle("dis", !v || SLEEPING);  /* REQ-042：休眠中保持锁定 */
+  if (!v) wheelSet("stop");
 }
 /* ---- 播报框选状态（v1.8）---- */
 let SEL_BTN = null, SEL_TMR = 0;
@@ -462,47 +465,103 @@ function cycleGear(){
   api("/api/gear", {idx: GEAR_IDX});   /* 同步后端，下个 nav 周期生效 */
 }
 
-/* 十字方向盘（v3.0）：只有前/后/左转/右转。
-   方向值 ±0.6 → 后端按当前档位取 x/yaw（REQ-033）；左/右走 data.yaw（原地转向），data.y 无通道故不用。
-   按住期间由 setInterval(100ms) 保活持续下发，松手立即置零。 */
-const DPAD_VEC = { fwd:{x: 0.6, yaw: 0}, back:{x:-0.6, yaw: 0},
-                   left:{x: 0, yaw: 0.6}, right:{x: 0, yaw:-0.6},
-                   stop:{x: 0, yaw: 0} };
-let DPAD_DIR = "stop";
-function dpadSet(dir){
-  if (!ARMED && dir !== "stop") return;
-  DPAD_DIR = dir;
-  const v = DPAD_VEC[dir] || DPAD_VEC.stop;
+/* REQ-044：圆形八向方向盘（取代十字盘，解决前进+转向互斥）。
+   8 个离散档位对齐后端 STEER 量化能力；斜向=前进(后退)同时转向。
+   关键交互：拖动中不松手，从「前+左」拖回「前」即恢复直行；松手/失焦才回中停止。
+   键盘 ↑+← 同理：松开 ← 自动恢复 ↑，不必松开 ↑ 再重按。 */
+const WHEEL_VEC = {
+  stop:{x:0, yaw:0}, fwd:{x:0.6, yaw:0}, back:{x:-0.6, yaw:0},
+  left:{x:0, yaw:0.6}, right:{x:0, yaw:-0.6},
+  fwdleft:{x:0.6, yaw:0.6}, fwdright:{x:0.6, yaw:-0.6},
+  backleft:{x:-0.6, yaw:0.6}, backright:{x:-0.6, yaw:-0.6}
+};
+const WHEEL_TXT = { stop:"停", fwd:"前进", back:"后退", left:"左转", right:"右转",
+                    fwdleft:"前+左", fwdright:"前+右", backleft:"后+左", backright:"后+右" };
+const WHEEL_POS = { stop:[0,0], fwd:[0,-1], back:[0,1], left:[-1,0], right:[1,0],
+                    fwdleft:[-0.72,-0.72], fwdright:[0.72,-0.72],
+                    backleft:[-0.72,0.72], backright:[0.72,0.72] };
+const WHEEL_THROW = 46;   /* thumb 最大偏移像素 */
+let WHEEL_DIR = "stop";
+function wheelSet(dir){
+  if (dir !== "stop" && (!ARMED || SLEEPING)) return;
+  WHEEL_DIR = WHEEL_VEC[dir] ? dir : "stop";
+  const v = WHEEL_VEC[WHEEL_DIR];
   curNav.x = v.x; curNav.y = 0; curNav.yaw = v.yaw;
-  document.querySelectorAll(".dp").forEach(b=>{
-    b.classList.toggle("on", dir !== "stop" && b.dataset.dir === dir);
-  });
+  const [px, py] = WHEEL_POS[WHEEL_DIR];
+  const th = document.getElementById("wthumb");
+  if (th){
+    th.style.transform = "translate(" + (px*WHEEL_THROW).toFixed(1) + "px," + (py*WHEEL_THROW).toFixed(1) + "px)";
+    th.textContent = WHEEL_TXT[WHEEL_DIR];
+  }
+  document.getElementById("wheel").classList.toggle("active", WHEEL_DIR !== "stop");
   sendNav();
 }
-function dpadBind(){
-  document.querySelectorAll(".dp").forEach(b=>{
-    const d = b.dataset.dir;
-    /* REQ-030：不再 e.preventDefault()——它会连同移动端页面滚动一起被抑制。
-       滚动改由 CSS touch-action:pan-y 严格控制：按住触发方向指令，纵向滑动交给浏览器滚动并由 pointercancel 松手 */
-    b.addEventListener("pointerdown", ()=>{ dpadSet(d); });
-    b.addEventListener("contextmenu", e=>e.preventDefault());
+function wheelDirFromXY(dx, dy){
+  const r = Math.hypot(dx, dy);
+  if (r < 12) return "stop";                         /* 中心死区，防误触 */
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  if (ax < r*0.42) return dy < 0 ? "fwd" : "back";    /* 竖直扇区 */
+  if (ay < r*0.42) return dx > 0 ? "right" : "left";  /* 水平扇区 */
+  return dy < 0 ? (dx > 0 ? "fwdright" : "fwdleft")
+                : (dx > 0 ? "backright" : "backleft");
+}
+const WHEEL_KEYSET = new Set();
+function wheelKeyDir(){
+  const k = WHEEL_KEYSET;
+  if (!k.size) return "stop";
+  const f = k.has("fwd"), b = k.has("back"), l = k.has("left"), r = k.has("right");
+  if (f && !b && l && !r) return "fwdleft";
+  if (f && !b && r && !l) return "fwdright";
+  if (b && !f && l && !r) return "backleft";
+  if (b && !f && r && !l) return "backright";
+  if (f === b) return "stop";                         /* 前后同按抵消 */
+  if (l === r) return f ? "fwd" : "back";             /* 左右同按抵消 */
+  return f ? "fwd" : (b ? "back" : (l ? "left" : "right"));
+}
+function wheelBind(){
+  const w = document.getElementById("wheel");
+  if (!w) return;
+  let activeId = null;
+  const apply = e => {
+    const r = w.getBoundingClientRect();
+    wheelSet(wheelDirFromXY(e.clientX - (r.left + r.width/2),
+                            e.clientY - (r.top + r.height/2)));
+  };
+  w.addEventListener("pointerdown", e=>{
+    if (!ARMED || SLEEPING) return;
+    activeId = e.pointerId;
+    try { w.setPointerCapture(e.pointerId); } catch(_){}
+    e.preventDefault(); apply(e);
   });
-  // 任何位置松手都归零（比 pointerleave 更安全）
-  window.addEventListener("pointerup", ()=>{ if (DPAD_DIR !== "stop") dpadSet("stop"); });
-  window.addEventListener("pointercancel", ()=>{ if (DPAD_DIR !== "stop") dpadSet("stop"); });
-  window.addEventListener("blur", ()=>{ if (DPAD_DIR !== "stop") dpadSet("stop"); });
-  // 键盘方向键
-  const KEYMAP = {ArrowUp:"fwd", ArrowDown:"back", ArrowLeft:"left", ArrowRight:"right"};
+  w.addEventListener("pointermove", e=>{
+    if (e.pointerId === activeId){ e.preventDefault(); apply(e); }
+  });
+  const release = e=>{
+    if (activeId !== null && e.pointerId !== activeId) return;
+    activeId = null; wheelSet("stop");
+  };
+  w.addEventListener("pointerup", release);
+  w.addEventListener("pointercancel", release);
+  w.addEventListener("lostpointercapture", release);
+  w.addEventListener("contextmenu", e=>e.preventDefault());
+  window.addEventListener("blur", ()=>{ activeId = null; WHEEL_KEYSET.clear(); wheelSet("stop"); });
+  /* 键盘：按住 ↑ 再按 ← = 前+左；松开 ← 自动恢复 ↑（不松 ↑） */
+  const KMAP = {ArrowUp:"fwd", ArrowDown:"back", ArrowLeft:"left", ArrowRight:"right"};
   window.addEventListener("keydown", e=>{
-    const d = KEYMAP[e.key];
-    if (!d || e.repeat) return;
+    const d = KMAP[e.key];
+    if (!d) return;
     const t = document.activeElement && document.activeElement.tagName;
     if (t === "INPUT" || t === "TEXTAREA") return;
-    e.preventDefault(); dpadSet(d);
+    e.preventDefault();
+    WHEEL_KEYSET.add(d); wheelSet(wheelKeyDir());
   });
-  window.addEventListener("keyup", e=>{ if (KEYMAP[e.key]) dpadSet("stop"); });
+  window.addEventListener("keyup", e=>{
+    const d = KMAP[e.key];
+    if (!d) return;
+    WHEEL_KEYSET.delete(d); wheelSet(wheelKeyDir());
+  });
 }
-dpadBind();
+wheelBind();
 setInterval(()=>{ if(ARMED) sendNav(); }, 100);   // 断线保活
 let navTimer = 0;
 function sendNav(){

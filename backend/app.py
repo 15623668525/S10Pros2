@@ -153,6 +153,7 @@ ARMED = False
 # 话题实测无效）。物理等效序列 = 趴下(4) → 贴地 → 关节阻尼(2)（关节下电，
 # 与厂商休眠 CSV 关节列全 0 一致）；唤醒复用站立序列 1→17（stand_sequence）。
 SLEEP_REQ = False
+SLEEP_REQ_TS = 0.0   # D-040：最近一次休眠请求时刻，用于给遥测自动清标志留趴下过渡宽限
 NAV_CMD = {"x": 0.0, "y": 0.0, "yaw": 0.0}
 NAV_LAST_TS = 0.0
 NAV_LIMIT = {"x": 0.6, "y": 0.4, "yaw": 0.8}  # 旧 /NAV_CMD 限幅（m/s, rad/s），仅备用
@@ -490,6 +491,7 @@ def sleep_detect(mi):
     - 厂商休眠（手柄/自动闲置，D-039）表现为 state 恒 0 + 高度贴地 + 忽略指令，
       给出"疑似"提示由前端展示（区别于正常空闲趴地，无法完全区分，仅提示）。
     """
+    global SLEEP_REQ
     if not mi:
         return {"sleep": False, "suspect": False}
     try:
@@ -497,6 +499,12 @@ def sleep_detect(mi):
         h = float(mi.get("height") or 0.0)
     except Exception:
         return {"sleep": False, "suspect": False}
+    # D-040：手柄/自动唤醒后 SLEEP_REQ 会粘滞为 True，导致前端方向盘被永久锁死。
+    # 下发休眠后 6s 宽限内不自动清（趴下过渡期 state 可能仍是 17、高度未降完）；
+    # 之后遥测明确处于站姿（state!=0 且 h>0.30）即视为已唤醒，自动清标志。
+    if SLEEP_REQ and time.time() - SLEEP_REQ_TS > 6.0 and s != 0 and h > 0.30:
+        SLEEP_REQ = False
+        log("SLEEP flag cleared by telemetry: awake (state=%d h=%.3f)" % (s, h))
     confirmed = (s == 0x1001) or (SLEEP_REQ and s == 2 and h < 0.12)
     suspect = (not confirmed and not SLEEP_REQ and s == 0 and h < 0.10)
     return {"sleep": confirmed or SLEEP_REQ, "suspect": suspect}
@@ -1852,7 +1860,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        global ARMED, NAV_CMD, NAV_LAST_TS, GEAR_IDX, SLEEP_REQ
+        global ARMED, NAV_CMD, NAV_LAST_TS, GEAR_IDX, SLEEP_REQ, SLEEP_REQ_TS
         self._meter_request()   # REQ-029：计入上行请求字节（控制/音频等指令）
         path = self.path.split("?")[0]
         # 喊话音频上传是二进制 body（WAV / PCM），不走 JSON 解析
@@ -1922,6 +1930,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 唤醒 = 站立序列 1→(等高稳定)→17→自动挂步态（与「站立」按钮同路径）
                 sl = bool(body.get("sleep"))
                 SLEEP_REQ = sl
+                SLEEP_REQ_TS = time.time()
                 if sl:
                     # 进休眠前先撤速度使能并清零速度，避免唤醒后残留行走指令
                     ARMED = False
