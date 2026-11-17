@@ -7,19 +7,19 @@
 <style>
   :root { --bg:#f5f6f8; --card:#fff; --line:#e3e6ea; --txt:#1c2330; --sub:#6b7686;
           --accent:#2563eb; --danger:#dc2626; --ok:#16a34a; --warn:#d97706; }
-  /* REQ-032：四模块版面间距整体压缩（模块间/卡片内边距/标题下边距/方向盘尺寸/按钮与列表高度） */
+  /* REQ-032 / REQ-046：四模块版面间距整体压缩（模块间/卡片内边距/标题下边距/方向盘尺寸/按钮与列表高度） */
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
   header { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; background:var(--card); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10;}
   header h1 { font-size:16px; margin:0; }
   .conn { font-size:12px; padding:3px 10px; border-radius:12px; background:#fee2e2; color:var(--danger); }
   .conn.on { background:#dcfce7; color:var(--ok); }
-  main { display:grid; grid-template-columns: 1fr; gap:8px; padding:10px; max-width:980px; margin:0 auto; }
+  main { display:grid; grid-template-columns: 1fr; gap:5px; padding:7px; max-width:980px; margin:0 auto; }
   @media(min-width:860px){ main { grid-template-columns: 340px 1fr; } }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:9px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:7px; }
   .card h2 { font-size:13px; color:var(--sub); margin:0 0 10px; font-weight:600; letter-spacing:.5px; }
-  .cardh { display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:7px;
-           flex-wrap:wrap; row-gap:4px; }
+  .cardh { display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:5px;
+           flex-wrap:wrap; row-gap:3px; }
   .cardh h2 { margin:0; flex:0 0 auto; }
   .cardh .tleft { display:flex; align-items:center; gap:6px; flex:0 1 auto; min-width:0; }
   .cardh .hgrp { display:flex; align-items:center; gap:6px; flex:0 0 auto; margin-left:auto; }
@@ -205,7 +205,7 @@
         <div><div class="k">电量</div><div class="v"><span id="s_batt">-</span><span class="vs" id="s_batt_st">-</span></div></div>
       </div>
     </div>
-    <div class="card" style="margin-top:8px">
+    <div class="card" style="margin-top:4px">
       <div class="cardh">
         <div class="tleft">
           <h2>摄像头</h2>
@@ -257,7 +257,7 @@
         <button id="g_high" onclick="gaitHigh()">步态·高台</button>
       </div>
     </div>
-    <div class="card" style="margin-top:8px">
+    <div class="card" style="margin-top:4px">
       <div class="cardh">
         <div class="tleft">
           <h2>语音</h2>
