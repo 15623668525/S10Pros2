@@ -103,6 +103,9 @@
   button.gearbtn { padding:4px 10px; font-size:12px; border-radius:12px; line-height:1.2;
                    background:#eff6ff; border-color:#93b4f5; color:#1d4ed8; white-space:nowrap; }
   button.gearbtn b { font-variant-numeric:tabular-nums; }
+  /* REQ-042：休眠/唤醒切换（运动控制标题旁）。休眠中=橙底提示可唤醒；平时=休眠入口 */
+  button.sleepbtn { background:#fff7ed; border-color:#fdba74; color:#c2410c; }
+  button.sleepbtn.on { background:#fdba74; border-color:#f97316; color:#fff; }
   button { border:1px solid var(--line); background:var(--card); color:var(--txt); border-radius:10px;
            padding:12px 6px; font-size:14px; cursor:pointer; font-weight:600; }
   button:active { transform:scale(.96); }
@@ -229,6 +232,8 @@
         <div class="tleft">
           <h2>运动控制</h2>
           <button class="gearbtn" id="gearBtn" onclick="cycleGear()" title="点击切换速度档位（低速/中速/高速）">中速 <b>0.8m/s</b></button>
+          <!-- REQ-042：休眠/唤醒切换（D-039 休眠事件后新增）。休眠=趴下+关节下电（4→2 序列），唤醒=自动站立 -->
+          <button class="gearbtn sleepbtn" id="sleepBtn" onclick="toggleSleep()" title="点击进入休眠（趴下并关节下电）">🌙 休眠</button>
         </div>
         <div class="hgrp">
           <button class="sw" id="armBtn" onclick="toggleArm()" title="速度控制未使能（点击开启）" aria-label="速度控制使能"><i>🔒</i></button>
@@ -295,7 +300,7 @@
   </section>
 </main>
 <script>
-const STATE_TXT = {0:"空闲",1:"站立",2:"软急停",3:"开机阻尼",4:"趴下",17:"全站姿"};
+const STATE_TXT = {0:"空闲",1:"站立",2:"软急停",3:"开机阻尼",4:"趴下",17:"全站姿",4097:"阻尼趴下(休眠)"};
 /* v2.5：步态三档固定（平地/楼梯/高台），基础步态不再单独给按钮（站立后自动就是基础） */
 const G_FLAT = 0x3002, G_STAIR = 0x3003, G_HIGH = 0x1002;
 const GAIT_TXT = {[G_HIGH]:"高台",[G_FLAT]:"平地",[G_STAIR]:"楼梯",4097:"基础"};
@@ -367,6 +372,27 @@ function gait(g){ api("/api/gait",{gait:g}); }
    否则进了高台就没有"退出"的按钮了 */
 function gaitHigh(){ gait(Number(CUR_GAIT) === G_HIGH ? 4097 : G_HIGH); }
 function estop(){ setArm(false); api("/api/estop",{}); }
+/* REQ-042：休眠/唤醒切换。休眠=趴下后关节下电（后端序列 4→2；厂商协议无独立休眠指令）；
+   唤醒=后端站立序列 1→17→自动挂步态。状态以后端 /api/status 回报为准（poll 同步）。 */
+let SLEEPING = false;
+async function toggleSleep(){
+  const target = !SLEEPING;
+  const r = await api("/api/motion/sleep", {sleep: target});
+  if (r && r.ok){
+    setSleep(!!r.sleep);
+    if (!r.sleep) STAND_TIP = Date.now() + 6000;   /* 唤醒=站立，给起立提示留 6s */
+  }
+}
+function setSleep(v){
+  SLEEPING = v;
+  const b = document.getElementById("sleepBtn");
+  b.textContent = v ? "☀️ 唤醒" : "🌙 休眠";
+  b.classList.toggle("on", v);
+  b.title = v ? "机器人休眠中（趴下+关节下电），点击唤醒（自动站立）"
+              : "点击进入休眠（趴下并关节下电；厂商休眠还含关相机等，此处为协议等效通道）";
+  /* 休眠中禁止十字盘操作（速度使能也已被后端撤销），唤醒后按 ARMED 状态恢复 */
+  document.getElementById("dpad").classList.toggle("dis", v || !ARMED);
+}
 async function toggleArm(){ const r = await api("/api/arm",{armed:!ARMED}); setArm(r.armed); }
 function setArm(v){
   ARMED = v;
@@ -374,7 +400,7 @@ function setArm(v){
   b.classList.toggle("on", v);
   b.title = v ? "速度控制已使能（点击关闭）" : "速度控制未使能（点击开启）";
   b.firstElementChild.textContent = v ? "🔓" : "🔒";
-  document.getElementById("dpad").classList.toggle("dis", !v);
+  document.getElementById("dpad").classList.toggle("dis", !v || SLEEPING);   /* REQ-042：休眠中保持锁定 */
   if (!v) dpadSet("stop");
 }
 /* ---- 播报框选状态（v1.8）---- */
@@ -1101,7 +1127,13 @@ async function poll(){
     document.getElementById("conn").textContent = "已连接";
     document.getElementById("conn").classList.add("on");
     const m = s.motion || {};
+    /* REQ-042：休眠状态以后端回报为准（0x1001 阻尼趴下确认 / 请求标志），多端切换保持一致 */
+    if (m.sleep != null && !!m.sleep !== SLEEPING) setSleep(!!m.sleep);
     document.getElementById("s_state").textContent = STATE_TXT[m.state] ?? m.state ?? "-";
+    /* D-039 遗留提示：state=0 且贴地可能是厂商休眠（手柄/闲置触发），届时站立/行走均无效 */
+    document.getElementById("s_state").style.color = m.suspect ? "var(--warn)" : "";
+    if (m.suspect) document.getElementById("s_state").title = "疑似休眠（state=0 且贴地）：若站立/行走无效，请先点「唤醒」或用手柄退出休眠";
+    else document.getElementById("s_state").title = "";
     document.getElementById("s_gait").textContent = GAIT_TXT[m.gait] ?? ("0x"+(m.gait>>>0).toString(16)) ?? "-";
     /* v2.5：步态按钮高亮跟随实际回报值，避免"点了但被缓存"时看不出到底切没切 */
     CUR_GAIT = Number(m.gait) || 0;

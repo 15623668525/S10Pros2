@@ -148,6 +148,11 @@ BATTERY_INFO = {}
 AUDIO_STATUS = {}
 AUDIO_EVT = {"ts": 0.0}   # 最近一次收到 /AUDIO/STATUS 的时间（用于判断指令是否被调度器接受）
 ARMED = False
+# REQ-042：休眠/唤醒切换（D-039 休眠事件后新增）。
+# 厂商协议没有独立"休眠"指令（ASDU 1.2.3 / 话题 2.2.1 均无；0x1001 阻尼趴下仅 ASDU 表有、
+# 话题实测无效）。物理等效序列 = 趴下(4) → 贴地 → 关节阻尼(2)（关节下电，
+# 与厂商休眠 CSV 关节列全 0 一致）；唤醒复用站立序列 1→17（stand_sequence）。
+SLEEP_REQ = False
 NAV_CMD = {"x": 0.0, "y": 0.0, "yaw": 0.0}
 NAV_LAST_TS = 0.0
 NAV_LIMIT = {"x": 0.6, "y": 0.4, "yaw": 0.8}  # 旧 /NAV_CMD 限幅（m/s, rad/s），仅备用
@@ -474,6 +479,52 @@ def nav_loop():
         except Exception as e:
             log("nav_loop error: %r" % e)
         time.sleep(STEER_PERIOD_S)
+
+
+def sleep_detect(mi):
+    """REQ-042：休眠状态判定。
+
+    - 我们的休眠序列 = 趴下(4)→关节阻尼(2)：请求标志 SLEEP_REQ 置位期间视为休眠，
+      /MOTION_INFO 回报 state==2 且贴地（h<0.12）视为已确认（急停也发 2，必须结合
+      请求标志区分，否则趴下后急停会被误判成休眠）；
+    - 厂商休眠（手柄/自动闲置，D-039）表现为 state 恒 0 + 高度贴地 + 忽略指令，
+      给出"疑似"提示由前端展示（区别于正常空闲趴地，无法完全区分，仅提示）。
+    """
+    if not mi:
+        return {"sleep": False, "suspect": False}
+    try:
+        s = int(mi.get("state") or 0)
+        h = float(mi.get("height") or 0.0)
+    except Exception:
+        return {"sleep": False, "suspect": False}
+    confirmed = (s == 0x1001) or (SLEEP_REQ and s == 2 and h < 0.12)
+    suspect = (not confirmed and not SLEEP_REQ and s == 0 and h < 0.10)
+    return {"sleep": confirmed or SLEEP_REQ, "suspect": suspect}
+
+
+def sleep_sequence():
+    """休眠动作：趴下(4) → 等贴地 → 关节阻尼(2)（关节下电）。
+
+    厂商协议没有独立"休眠"指令：ROS2 /MOTION_STATE 话题只支持 1/2/4/17（指南 2.2.1），
+    0x1001 阻尼趴下仅 ASDU 参数表有（指南 1.2.3），话题下发实测无效（2026-11-17 真机：
+    0x1001 后 state=17/h=0.387 纹丝不动）。本应用不实现 ASDU，物理等效序列 =
+    趴下后切关节阻尼（厂商休眠 = 趴下 + 关节下电，见 D-039 CSV 关节列全 0）。
+    """
+    try:
+        BRIDGE.publish_state(4)
+        t0 = time.time()
+        while time.time() - t0 < 8.0:
+            with LOCK:
+                mi = dict(MOTION_INFO)
+            h = float(mi.get("height") or 1.0)
+            if h < 0.12:            # 已贴地（趴稳 h≈0.08）
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)             # 稳半秒再下电，避免趴下动作未完成
+        BRIDGE.publish_state(2)     # 关节阻尼 → 关节下电（与厂商休眠的物理表现一致）
+        log("SLEEP seq: 4(趴下) -> 2(关节阻尼/下电), h=%.3f" % h)
+    except Exception as e:
+        log("sleep_sequence error: %r" % e)
 
 
 def stand_sequence():
@@ -1689,7 +1740,9 @@ class Handler(BaseHTTPRequestHandler):
                 cmd = dict(NAV_CMD)
             with LOCK:
                 vol = VOLUME["pct"]
-            self._send(200, {"motion": mi, "audio": au, "battery": bat, "armed": armed,
+            mi2 = dict(mi)
+            mi2.update(sleep_detect(mi))   # REQ-042：休眠状态（确认 0x1001 / 请求标志 / 疑似厂商休眠）
+            self._send(200, {"motion": mi2, "audio": au, "battery": bat, "armed": armed,
                              "nav_cmd": cmd, "limits": NAV_LIMIT,
                              "steer": {"gear_x": list(STEER_GEAR_X),
                                        "gear_yaw": list(STEER_GEAR_YAW),
@@ -1799,7 +1852,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        global ARMED, NAV_CMD, NAV_LAST_TS, GEAR_IDX
+        global ARMED, NAV_CMD, NAV_LAST_TS, GEAR_IDX, SLEEP_REQ
         self._meter_request()   # REQ-029：计入上行请求字节（控制/音频等指令）
         path = self.path.split("?")[0]
         # 喊话音频上传是二进制 body（WAV / PCM），不走 JSON 解析
@@ -1862,6 +1915,25 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/motion/rl":
                 BRIDGE.publish_state(17)
                 self._send(200, {"ok": True})
+            elif path == "/api/motion/sleep":
+                # REQ-042：休眠/唤醒切换（D-039 后新增）
+                # 休眠 = 序列 4(趴下)→贴地→2(关节阻尼/下电)，物理等效厂商休眠
+                #         （指南无独立休眠指令；0x1001 仅 ASDU 表有、话题实测无效）
+                # 唤醒 = 站立序列 1→(等高稳定)→17→自动挂步态（与「站立」按钮同路径）
+                sl = bool(body.get("sleep"))
+                SLEEP_REQ = sl
+                if sl:
+                    # 进休眠前先撤速度使能并清零速度，避免唤醒后残留行走指令
+                    ARMED = False
+                    with LOCK:
+                        NAV_CMD.update({"x": 0.0, "y": 0.0, "yaw": 0.0})
+                    threading.Thread(target=sleep_sequence, daemon=True).start()
+                    log("SLEEP -> sleep_sequence(4->2)")
+                    self._send(200, {"ok": True, "sleep": True})
+                else:
+                    threading.Thread(target=stand_sequence, daemon=True).start()
+                    log("WAKE -> stand_sequence(1->17)")
+                    self._send(200, {"ok": True, "sleep": False})
             elif path == "/api/gait":
                 BRIDGE.publish_gait(int(body["gait"]))
                 self._send(200, {"ok": True})
