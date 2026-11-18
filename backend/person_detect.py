@@ -23,22 +23,24 @@ import numpy as np
 import onnxruntime as ort
 
 # ---- 配置（环境变量可覆盖）----
+# REQ-049 距离升级（2026-11-18）：imgsz=1280 + conf=0.35，有效检测距离 ≈13~14m → ≈30m
+# （《人员检测有效距离分析_20261118》：640@0.45 可靠框高需 ≥51px，20m 人降采样后仅 23px 必漏检）
 RTSP_BASE = os.environ.get("S10YK_RTSP_BASE", "rtsp://<ROBOT_IP>:8554")
-MODEL = os.environ.get("PERSON_MODEL", "/opt/s10yk/models/yolov8n.onnx")
+MODEL = os.environ.get("PERSON_MODEL", "/opt/s10yk/models/yolov8n_1280.onnx")
 SAVE_ROOT = os.environ.get("PERSON_SAVE_ROOT", "/opt/s10yk/data/person")   # REQ-048：DATA 目录
 LATEST = os.path.join(SAVE_ROOT, "latest.json")
 HISTORY = os.path.join(SAVE_ROOT, "history.jsonl")
 STATUS = os.path.join(SAVE_ROOT, "detector_status.json")
 STATS = os.path.join(SAVE_ROOT, "stats.json")   # REQ-048：统计信息（总人数/当前人数/存储）
 SWITCHES = os.path.join(SAVE_ROOT, "switches.json")   # REQ-049：4 路摄像头检测开关（app.py 写、本服务读）
-CONF_TH = float(os.environ.get("PERSON_CONF", "0.45"))
+CONF_TH = float(os.environ.get("PERSON_CONF", "0.35"))
 NMS_TH = float(os.environ.get("PERSON_NMS", "0.45"))
 COOLDOWN_S = float(os.environ.get("PERSON_COOLDOWN", "8"))
 DETECT_FPS = float(os.environ.get("PERSON_FPS", "3"))
 KEEP_DAYS = int(os.environ.get("PERSON_KEEP_DAYS", "2"))          # REQ-048：只保留 2 天
 QUOTA_DAYS = int(os.environ.get("PERSON_QUOTA_DAYS", "3"))        # REQ-048：配额按 3 天图片空间预估
 QUOTA_MIN = float(os.environ.get("PERSON_QUOTA_MIN_MB", "100")) * 1024 * 1024   # 配额下限
-INTRA_THREADS = int(os.environ.get("PERSON_THREADS", "6"))
+INTRA_THREADS = int(os.environ.get("PERSON_THREADS", "8"))        # 1280 输入实测 8 线程 ≈190ms/帧
 
 # cam_id: (url后缀, 名称, 声音键) —— 标签按 D-033 修正：video0后视 video2左视 video4前视 video6右视
 CAMS = [
