@@ -30,6 +30,7 @@ LATEST = os.path.join(SAVE_ROOT, "latest.json")
 HISTORY = os.path.join(SAVE_ROOT, "history.jsonl")
 STATUS = os.path.join(SAVE_ROOT, "detector_status.json")
 STATS = os.path.join(SAVE_ROOT, "stats.json")   # REQ-048：统计信息（总人数/当前人数/存储）
+SWITCHES = os.path.join(SAVE_ROOT, "switches.json")   # REQ-049：4 路摄像头检测开关（app.py 写、本服务读）
 CONF_TH = float(os.environ.get("PERSON_CONF", "0.45"))
 NMS_TH = float(os.environ.get("PERSON_NMS", "0.45"))
 COOLDOWN_S = float(os.environ.get("PERSON_COOLDOWN", "8"))
@@ -130,6 +131,39 @@ def bump_total(n):
 OPEN_LOCK = threading.Lock()   # FFMPEG RTSP 并发 open 会死锁，串行化打开阶段
 
 
+# ---- REQ-049：4 路检测开关（app.py 写 switches.json，本服务监听；缺省全开） ----
+SWITCH_LOCK = threading.Lock()
+SWITCH_STATE = {cid: True for cid, _, _ in CAMS}
+SWITCH_MTIME = 0.0
+
+
+def _poll_switches():
+    """检查 switches.json 是否变化（mtime 触发，未变化零开销）。返回本路开关。"""
+    global SWITCH_MTIME
+    try:
+        mt = os.path.getmtime(SWITCHES)
+    except OSError:
+        return
+    if mt == SWITCH_MTIME:
+        return
+    SWITCH_MTIME = mt
+    try:
+        with open(SWITCHES, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        with SWITCH_LOCK:
+            for cid in SWITCH_STATE:
+                if cid in obj:
+                    SWITCH_STATE[cid] = bool(obj[cid])
+        log("switches reload: %s" % {cid: SWITCH_STATE[cid] for cid in SWITCH_STATE})
+    except Exception as e:
+        log("switches load error: %r" % e)
+
+
+def switch_on(cam_id):
+    with SWITCH_LOCK:
+        return SWITCH_STATE.get(cam_id, True)
+
+
 class CamWorker(threading.Thread):
     def __init__(self, cam_id, cam_name, voice_key, det):
         super().__init__(daemon=True, name="cam-" + cam_id)
@@ -191,6 +225,22 @@ class CamWorker(threading.Thread):
         last_t, nframes, fps_t0 = 0.0, 0, time.time()
         cap = None
         while True:
+            # REQ-049：开关为关 → 释放连接停检测（省 CPU/带宽），为开 → 正常取流
+            _poll_switches()
+            if not switch_on(self.cam_id):
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = None
+                    log("%s detection OFF, stream released" % self.cam_id)
+                self.ring.clear()
+                self.state["cur_n"] = 0
+                self.state["cur_ts"] = time.time()
+                self.state["last_err"] = ""
+                time.sleep(1.0)
+                continue
             try:
                 if cap is None or not cap.isOpened():
                     log("%s connecting..." % self.url)
@@ -354,6 +404,9 @@ def _stats_loop(workers):
                 STATS_OBJ["current"] = cur
                 STATS_OBJ["storage"] = {"used": QUOTA["used"], "quota": QUOTA["bytes"],
                                         "full": QUOTA["full"]}
+                # REQ-049：各路开关状态（前端人员检测页渲染 4 个开关）
+                with SWITCH_LOCK:
+                    STATS_OBJ["switches"] = dict(SWITCH_STATE)
                 STATS_OBJ["ts"] = now
             _atomic_json(STATS, STATS_OBJ)
         except Exception as e:

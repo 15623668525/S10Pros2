@@ -36,6 +36,14 @@
             animation:paPulse 1.6s ease-in-out infinite; }
   .palert .pgo { margin-left:auto; font-weight:500; opacity:.9; font-size:11.5px; white-space:nowrap; }
   @keyframes paPulse { 0%,100%{filter:brightness(1)} 50%{filter:brightness(1.15)} }
+  /* REQ-049：人员检测页 4 路检测开关 */
+  .psw { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:999px;
+         background:#1b2230; color:#9aa4b2; border:1px solid #2a3346; font-size:11.5px;
+         font-weight:600; cursor:pointer; line-height:1.6; }
+  .psw .dot { width:7px; height:7px; border-radius:50%; background:#4b5563; flex:none; }
+  .psw.on { background:#14261c; color:#4ade80; border-color:#2e5c40; }
+  .psw.on .dot { background:#4ade80; box-shadow:0 0 5px rgba(74,222,128,.7); }
+  .psw:active { transform:scale(.96); }
   /* REQ-047：人体抓拍查看浮层 */
   #shotLayer { position:fixed; inset:0; background:rgba(12,16,24,.86); z-index:60; display:none;
                flex-direction:column; align-items:center; justify-content:center; padding:14px; }
@@ -251,6 +259,14 @@
             <span>当前人数 <b id="pCur" style="font-variant-numeric:tabular-nums">-</b></span>
             <span>存储 <b id="pStore" style="font-variant-numeric:tabular-nums">…</b></span>
             <span id="pFull" style="color:#f87171;font-weight:700;display:none">⚠️ 配额已满 暂停抓拍</span>
+          </div>
+          <!-- REQ-049：4 路摄像头检测开关（开=检测该路画面，关=停止检测并释放该路视频流） -->
+          <div style="display:flex;gap:6px;align-items:center">
+            <span style="font-size:11px;color:#9aa4b2;flex:none">检测开关</span>
+            <button class="psw" data-cam="video4" onclick="togglePersonSwitch('video4')"><i class="dot"></i>前视</button>
+            <button class="psw" data-cam="video0" onclick="togglePersonSwitch('video0')"><i class="dot"></i>后视</button>
+            <button class="psw" data-cam="video2" onclick="togglePersonSwitch('video2')"><i class="dot"></i>左视</button>
+            <button class="psw" data-cam="video6" onclick="togglePersonSwitch('video6')"><i class="dot"></i>右视</button>
           </div>
           <div style="flex:1;min-height:0;position:relative;display:flex;align-items:center;justify-content:center;background:#000;border-radius:6px;overflow:hidden">
             <img id="personImg" style="max-width:100%;max-height:100%;object-fit:contain;display:none" alt="人员检测抓拍">
@@ -1242,6 +1258,11 @@ async function personPoll(){
     document.getElementById("pStore").textContent =
       qMB ? (uMB.toFixed(0) + "/" + qMB.toFixed(0) + "MB") : "…";
     document.getElementById("pFull").style.display = sg.full ? "inline" : "none";
+    /* REQ-049：4 路检测开关状态渲染 */
+    const sw = st.switches || {};
+    document.querySelectorAll("#personPage .psw").forEach(b=>{
+      b.classList.toggle("on", !!sw[b.dataset.cam]);
+    });
     const a = d.alert;
     const imgEl = document.getElementById("personImg");
     const emptyEl = document.getElementById("personEmpty");
@@ -1254,6 +1275,23 @@ async function personPoll(){
       emptyEl.style.display = "block";
     }
   }catch(e){}
+}
+/* REQ-049：切换某路人员检测开关（乐观更新，1Hz 轮询会以后端状态纠偏） */
+const PSW_NAMES = {video4:"前视", video0:"后视", video2:"左视", video6:"右视"};
+async function togglePersonSwitch(cam){
+  const btn = document.querySelector('#personPage .psw[data-cam="'+cam+'"]');
+  const toOn = !btn.classList.contains("on");       /* 乐观翻转 */
+  btn.classList.toggle("on", toOn);
+  try{
+    const r = await api("/api/person/switch", {cam: cam, on: toOn});
+    if (r && r.switches){                           /* 以后端回包为准 */
+      document.querySelectorAll("#personPage .psw").forEach(b=>{
+        b.classList.toggle("on", !!r.switches[b.dataset.cam]);
+      });
+    }
+  }catch(e){
+    btn.classList.toggle("on", !toOn);              /* 失败回滚 */
+  }
 }
 async function poll(){
   if (POLLING) return;          /* 上一轮未结束不再叠加 */

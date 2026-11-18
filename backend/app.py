@@ -96,6 +96,8 @@ SAY = {"sock": None, "stop": None, "name": "", "ts": 0.0, "active": False}
 # ---- 人体检测预警（REQ-047 一期：204 上 s10yk-persond 写 latest.json，本进程读取+播报）----
 PERSON_DIR = os.environ.get("S10YK_PERSON_DIR", "/opt/s10yk/data/person")   # REQ-048：DATA 目录
 PERSON_LATEST = os.path.join(PERSON_DIR, "latest.json")
+PERSON_SWITCHES = os.path.join(PERSON_DIR, "switches.json")   # REQ-049：4 路检测开关（本进程写、s10yk-persond 读）
+PERSON_CAMS = (("video4", "前视"), ("video0", "后视"), ("video2", "左视"), ("video6", "右视"))
 PERSON_VOICE_GAP = float(os.environ.get("S10YK_PERSON_VOICE_GAP", "25"))  # 语音最小间隔（s）
 PERSON_ALERT_TTL = float(os.environ.get("S10YK_PERSON_TTL", "60"))        # 前端横幅有效期（s）
 PERSON = {"spoken_ts": 0.0, "last_speak": 0.0}
@@ -1827,6 +1829,8 @@ class Handler(BaseHTTPRequestHandler):
                     st = json.load(f)
             except Exception:
                 pass
+            if "switches" not in st:   # REQ-049：检测服务未运行时缺省全开
+                st["switches"] = {c: True for c, _ in PERSON_CAMS}
             self._send(200, {"stats": st, "alert": person_alert_state()})
         elif path == "/api/person/latest":
             # REQ-047：最近一次人体预警（前端轮询用，比 /api/status 轻）
@@ -2160,6 +2164,35 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/talk/stop":
                 talk_stop("client")
                 self._send(200, {"ok": True, **talk_state()})
+            elif path == "/api/person/switch":
+                # REQ-049：4 路摄像头人员检测开关（on=True 检测，False 停止）
+                # 写 switches.json 原子文件，s10yk-persond 监听后释放/重连对应 RTSP 流
+                cam = str(body.get("cam", "")).strip()
+                names = dict(PERSON_CAMS)
+                if cam not in names:
+                    self._send(400, {"error": "invalid cam, expect one of %s" % ",".join(names)})
+                    return
+                on = bool(body.get("on"))
+                # 读改写保留未涉及路的现值（文件缺失时缺省全开）
+                cur = {c: True for c, _ in PERSON_CAMS}
+                try:
+                    with open(PERSON_SWITCHES, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    for c, _ in PERSON_CAMS:
+                        if c in loaded:
+                            cur[c] = bool(loaded[c])
+                except Exception:
+                    pass
+                if cur[cam] == on:
+                    self._send(200, {"ok": True, "switches": cur})   # 幂等：无变化
+                    return
+                cur[cam] = on
+                tmp = PERSON_SWITCHES + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cur, f, ensure_ascii=False)
+                os.replace(tmp, PERSON_SWITCHES)
+                log("PERSON switch %s(%s) -> %s" % (cam, names[cam], "ON" if on else "OFF"))
+                self._send(200, {"ok": True, "switches": cur})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
