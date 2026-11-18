@@ -46,6 +46,7 @@
 S10ykApp/
 ├── backend/                 # 控制台后端（云服务器）
 │   ├── app.py               # 全部后端逻辑（HTTP/TLS、ROS2 桥、喊话、对讲、代理）
+│   ├── person_detect.py     # 人员检测服务（REQ-047/048：4路RTSP+YOLOv8n，204 侧独立服务 s10yk-persond）
 │   └── s10yk.service        # systemd 单元
 ├── frontend/                # 前端（零构建单文件）
 │   ├── index.html           # 页面 + 全部 JS

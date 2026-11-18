@@ -93,6 +93,12 @@ BW_BLOCK = b"\0" * (512 * 1024)   # 512 KiB，够平滑又不过度占流量
 VOLUME_TARGET = 100          # 默认播报音量目标（需求：100%）
 VOLUME = {"pct": None, "ts": 0.0}
 SAY = {"sock": None, "stop": None, "name": "", "ts": 0.0, "active": False}
+# ---- 人体检测预警（REQ-047 一期：204 上 s10yk-persond 写 latest.json，本进程读取+播报）----
+PERSON_DIR = os.environ.get("S10YK_PERSON_DIR", "/opt/s10yk/data/person")   # REQ-048：DATA 目录
+PERSON_LATEST = os.path.join(PERSON_DIR, "latest.json")
+PERSON_VOICE_GAP = float(os.environ.get("S10YK_PERSON_VOICE_GAP", "25"))  # 语音最小间隔（s）
+PERSON_ALERT_TTL = float(os.environ.get("S10YK_PERSON_TTL", "60"))        # 前端横幅有效期（s）
+PERSON = {"spoken_ts": 0.0, "last_speak": 0.0}
 # 喊话会话：与 SAY 并列但独立；sayd 端是全局单例 PLAYER，任一播放开始必须先停另一个
 SHOUT = {"sock": None, "start_ts": 0.0, "last_ts": 0.0, "bytes": 0,
          "active": False, "mode": "", "ev": None, "rate": 16000, "channels": 1}
@@ -1640,6 +1646,52 @@ def cam_reaper():
                 pass
 
 
+def person_alert_state():
+    """REQ-047：读检测服务的 latest.json，返回最近一次人体预警（无则 None）
+
+    供 /api/status 下发前端横幅，也供语音守护线程判断"是否是新预警"。
+    """
+    try:
+        with open(PERSON_LATEST, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        ts = float(d.get("ts") or 0)
+        age = time.time() - ts
+        return {"ts": ts, "age": round(age, 1), "fresh": age <= PERSON_ALERT_TTL,
+                "cam_id": d.get("cam_id"), "cam_name": d.get("cam_name"),
+                "conf": d.get("conf"), "n": d.get("n"), "img": d.get("img"),
+                "voice_key": d.get("voice_key")}
+    except Exception:
+        return None
+
+
+def person_voice_watcher():
+    """REQ-047：新人体预警 → 语音播报（复用 say_wav / sayd 通道）
+
+    - 每条预警最多播一次（按 ts 去重）；
+    - 全局最小间隔 PERSON_VOICE_GAP，防 4 路轮流命中时刷屏；
+    - 播报失败不重试（避免卡死在异常 WAV 上），只记日志。
+    """
+    while True:
+        try:
+            st = person_alert_state()
+            if st and st["ts"] > PERSON["spoken_ts"]:
+                if time.time() - PERSON["last_speak"] >= PERSON_VOICE_GAP:
+                    name = "person_alert_%s.wav" % (st.get("voice_key") or "front")
+                    try:
+                        say_wav(name)          # 阻塞至播完
+                        PERSON["last_speak"] = time.time()
+                        log("PERSON 播报 %s (%s %.2f)" %
+                            (name, st.get("cam_name"), st.get("conf") or 0))
+                    except Exception as e:
+                        log("PERSON 播报失败 %s: %r" % (name, e))
+                    PERSON["spoken_ts"] = st["ts"]
+                else:
+                    PERSON["spoken_ts"] = st["ts"]   # 间隔内静默跳过，仍标记已处理
+        except Exception as e:
+            log("person watcher error: %r" % e)
+        time.sleep(2.0)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "S10YK/1.4"
     # REQ-039：实时对讲每秒约 10 个 PCM 小包，必须复用连接——
@@ -1765,7 +1817,62 @@ class Handler(BaseHTTPRequestHandler):
                              "net": {"bps": net_bps()},   # REQ-029：前后端双向交互流量速率（bit/s）
                              "shout": shout_state(),      # 单向喊话会话状态
                              "talk": talk_state(),        # 双向对讲会话状态（含 MIC 抢占计数）
+                             "person": person_alert_state(),   # REQ-047：最近一次人体预警
                              "now": time.time()})  # v2.3: 服务器时钟，供前端计算数据停留
+        elif path == "/api/person/stats":
+            # REQ-048：人员检测页 1Hz 轮询——统计信息（总人数/当前人数/存储配额）+ 最新抓拍
+            st = {}
+            try:
+                with open(os.path.join(PERSON_DIR, "stats.json"), "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception:
+                pass
+            self._send(200, {"stats": st, "alert": person_alert_state()})
+        elif path == "/api/person/latest":
+            # REQ-047：最近一次人体预警（前端轮询用，比 /api/status 轻）
+            self._send(200, {"alert": person_alert_state()})
+        elif path == "/api/person/list":
+            # REQ-047：最近 N 条预警记录（读 history.jsonl 尾部）
+            n = 20
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for kv in qs.split("&"):
+                if kv.startswith("n="):
+                    try:
+                        n = max(1, min(100, int(kv[2:])))
+                    except ValueError:
+                        pass
+            items = []
+            try:
+                with open(os.path.join(PERSON_DIR, "history.jsonl"), "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            items.append(json.loads(line))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self._send(200, {"items": items[-n:][::-1]})
+        elif path == "/api/person/img":
+            # REQ-047：下发抓拍图（仅允许 PERSON_DIR 内的相对路径，防目录穿越）
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            name = ""
+            for kv in qs.split("&"):
+                if kv.startswith("name="):
+                    name = kv[5:]
+            name = name.replace("%2F", "/").replace("%2f", "/")
+            fp = os.path.realpath(os.path.join(PERSON_DIR, name))
+            root = os.path.realpath(PERSON_DIR)
+            if (not name) or (not fp.startswith(root + os.sep)) or (not os.path.isfile(fp)):
+                self._send(404, {"error": "not found"})
+                return
+            try:
+                with open(fp, "rb") as f:
+                    self._send(200, f.read(), "image/jpeg")
+            except Exception as e:
+                self._send(500, {"error": str(e)})
         elif path == "/api/shout/state":
             self._send(200, shout_state())
         elif path == "/api/talk/state":
@@ -2070,6 +2177,7 @@ def main():
     threading.Thread(target=audio_bootstrap, daemon=True).start()
     threading.Thread(target=volume_keeper, daemon=True).start()
     threading.Thread(target=cam_reaper, daemon=True).start()
+    threading.Thread(target=person_voice_watcher, daemon=True).start()   # REQ-047：人体预警语音
     load_preset_durations()
     host = "0.0.0.0"
     port = int(os.environ.get("S10YK_PORT", "8080"))
