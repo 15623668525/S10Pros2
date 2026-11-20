@@ -17,6 +17,7 @@ S10 遥控应用后端 v2.9（纯标准库 HTTP + rclpy，零 pip 依赖）
 """
 import json
 import os
+import queue
 import select
 import socket
 import ssl
@@ -92,7 +93,12 @@ BW_BLOCK = b"\0" * (512 * 1024)   # 512 KiB，够平滑又不过度占流量
 # 播报音量（103 声卡 ES8323 的 PCM 混音，0-192 对应 0-100%）
 VOLUME_TARGET = 100          # 默认播报音量目标（需求：100%）
 VOLUME = {"pct": None, "ts": 0.0}
-SAY = {"sock": None, "stop": None, "name": "", "ts": 0.0, "active": False}
+SAY = {"sock": None, "stop": None, "name": "", "ts": 0.0, "active": False}   # 最新一路（兼容旧状态展示）
+# D-040 叠音根治：全部活动喂流注册表。此前单槽结构下，同秒双发（前端双击/多端各发一次/
+# 网络抖动重试）会让 say_stop 只停到"最新"一路，最早的一路成孤儿永久循环喂流——
+# sayd 侧同一 aplay 被两路 100ms 分片交错喂入，听感即"两股音频前后有时差"（2026-11-20 OPS-89）。
+SAY_FEEDERS = []                                    # [{"ev","sock","name","ts"}]，LOCK 保护
+SAY_LAST_PLAY = {"key": "", "ts": 0.0}              # 同文件幂等窗口：1s 内重复下发直接忽略
 # ---- 人体检测预警（REQ-047 一期：204 上 s10yk-persond 写 latest.json，本进程读取+播报）----
 PERSON_DIR = os.environ.get("S10YK_PERSON_DIR", "/opt/s10yk/data/person")   # REQ-048：DATA 目录
 PERSON_LATEST = os.path.join(PERSON_DIR, "latest.json")
@@ -192,13 +198,75 @@ def steer_gear(stick, gears):
     return (v if stick > 0 else -v), name
 LOG = []
 
+# D-041 日志防阻塞（2026-11-20）：journald 一旦停摆/限流不再消费 stdout 管道，
+# print 会永久阻塞——此前 log() 在 LOCK 内 print，一阻塞就把全部业务线程拖死
+# （实测 2026-11-20 16:31 整机无响应，py-spy 全部 handler 卡在 log 的 print）。
+# 改造：锁内只入内存环形列表；stdout/落盘交给专职泵线程；队列满即丢，永不阻塞业务。
+_LOGQ = queue.Queue(maxsize=2000)
+_LOG_FP = None
+_LOG_PUMP_ON = False
+
+
+def _log_pump():
+    global _LOG_FP
+    n = 0
+    while True:
+        line = _LOGQ.get()
+        try:
+            n += 1
+            try:
+                if _LOG_FP is None:
+                    try:
+                        os.makedirs("/opt/s10yk/logs", exist_ok=True)
+                        _LOG_FP = open("/opt/s10yk/logs/backend.log", "a",
+                                       encoding="utf-8", buffering=1)   # 行缓冲
+                    except Exception:
+                        _LOG_FP = False   # 打不开就不再尝试，纯内存
+                if _LOG_FP:
+                    try:
+                        # 每 2000 行查一次体积，>30MB 滚动到 .old（防无限增长）
+                        if n % 2000 == 0 and os.path.getsize("/opt/s10yk/logs/backend.log") > 30 * 1024 * 1024:
+                            _LOG_FP.close()
+                            _LOG_FP = None
+                            try:
+                                os.replace("/opt/s10yk/logs/backend.log",
+                                           "/opt/s10yk/logs/backend.log.old")
+                            except Exception:
+                                pass
+                        else:
+                            _LOG_FP.write(line + "\n")
+                    except Exception:
+                        _LOG_FP = None
+            except Exception:
+                pass
+            try:
+                print(line, flush=True)   # 管道堵也只堵泵线程自己
+            except Exception:
+                pass
+        except Exception:
+            time.sleep(0.1)
+
+
+def _log_pump_start():
+    global _LOG_PUMP_ON
+    with LOCK:
+        if _LOG_PUMP_ON:
+            return
+        _LOG_PUMP_ON = True
+        threading.Thread(target=_log_pump, daemon=True, name="log-pump").start()
+
 
 def log(msg):
     line = time.strftime("%H:%M:%S") + " " + str(msg)
     with LOCK:
         LOG.append(line)
         del LOG[:-200]
-    print(line, flush=True)
+    try:
+        _LOGQ.put_nowait(line)   # 满即丢：日志绝不能阻塞业务线程（D-041）
+    except Exception:
+        pass
+    if not _LOG_PUMP_ON:
+        _log_pump_start()
 
 
 def load_presets():
@@ -720,17 +788,13 @@ def _sayd_restart():
         log("SAY restart error: %r" % e)
 
 
-def say_stop():
-    """停止自定义语音：通知 sayd 停播并断开连接（sayd 会立即关闭 aplay 释放设备）"""
-    with LOCK:
-        sock = SAY.get("sock")
-        ev = SAY.get("stop")
-        active = SAY.get("active")
-        SAY["sock"] = None
-        SAY["stop"] = None
-        SAY["active"] = False
+def _say_kill_feeder(fe):
+    """停掉单个喂流：置事件 + 发 F_STOP + 断开（sayd 收到 STOP/EOF 即关 aplay 释放设备）"""
+    ev = fe.get("ev")
     if ev is not None:
         ev.set()
+    sock = fe.get("sock")
+    fe["sock"] = None
     if sock is not None:
         try:
             _say_frame(sock, F_STOP)
@@ -744,20 +808,38 @@ def say_stop():
             sock.close()
         except Exception:
             pass
+
+
+def say_stop():
+    """停止自定义语音：停掉**全部**活动喂流（D-040），并清空幂等窗口
+
+    - 逐路 ev.set() + F_STOP + 断连，sayd 端最终只剩一个被 STOP 的会话；
+    - 清空 SAY_LAST_PLAY：先停后放（stop → 立即重播同一文件）不受幂等窗口影响。
+    """
+    with LOCK:
+        feeders = list(SAY_FEEDERS)
+        SAY_FEEDERS.clear()
+        SAY.update({"sock": None, "stop": None, "active": False})
+        SAY_LAST_PLAY["key"] = ""
+    n = 0
+    for fe in feeders:
+        _say_kill_feeder(fe)
+        n += 1
+    if n > 1:
+        log("SAY stop -> killed %d feeder(s) (叠音风险已清除)" % n)
+    if n == 1:
         log("SAY stop -> device released")
         return True
-    if active:
-        # 控制连接已断（例如推流线程已退出），但 sayd 可能仍在播：补发一帧 STOP
-        try:
-            s = socket.create_connection((SAYD_HOST, SAYD_PORT), timeout=1.5)
-            _say_frame(s, F_STOP)
-            _say_reply(s)
-            s.close()
-            log("SAY stop (orphan) -> device released")
-            return True
-        except Exception as e:
-            log("SAY orphan stop error: %r" % e)
-    return False
+    # 控制连接已断（例如推流线程已退出），但 sayd 可能仍在播：补发一帧 STOP
+    try:
+        s = socket.create_connection((SAYD_HOST, SAYD_PORT), timeout=1.5)
+        _say_frame(s, F_STOP)
+        _say_reply(s)
+        s.close()
+        log("SAY stop (orphan) -> device released")
+        return True
+    except Exception:
+        return False
 
 
 def play_preset(audio_id, priority=5, repeat=1, interval_ms=0, preempt=2):
@@ -1346,6 +1428,21 @@ def say_wav(filename, loop=False, gap=None):
     if info["bits"] != 16:
         log("SAY warning: %s is %d-bit, sayd 以 S16_LE 播放" % (name, info["bits"]))
     gap = SAY_LOOP_GAP if gap is None else float(gap)
+    # D-040 幂等去重：1s 内同文件同模式重复下发直接忽略（前端双击/多端同秒各发一次/
+    # 网络抖动重试都会在这里被挡掉，从源头杜绝双喂流叠音）
+    dedup_key = name + (":loop" if loop else "")
+    now = time.time()
+    dup = False
+    with LOCK:
+        if SAY_LAST_PLAY["key"] == dedup_key and now - SAY_LAST_PLAY["ts"] < 1.0:
+            dup = True
+    if dup:
+        # D-040 幂等去重命中。注意 log() 内部也要取 LOCK（不可重入），
+        # 绝不能在 with LOCK 块内调用 log()，否则自死锁（2026-11-20 实测）。
+        log("SAY dedupe: %s within %.2fs -> ignore duplicate start" %
+            (dedup_key, now - SAY_LAST_PLAY["ts"]))
+        return {"mode": "sayd", "duration_ms": info["cycle_ms"],
+                "loop": bool(loop), "dedup": True}
     shout_stop()   # 互斥：喊话会话必须先停（sayd 全局单例 PLAYER）
     talk_stop("say-entry")   # 互斥：双向对讲也走 sayd + 占麦，一起收掉
     say_stop()
@@ -1365,6 +1462,7 @@ def say_wav(filename, loop=False, gap=None):
         pass
 
     ev = threading.Event()
+    fe = {"ev": ev, "sock": sock, "name": name, "ts": time.time()}   # D-040：注册表条目
     start_payload = json.dumps({"rate": info["rate"], "channels": info["channels"]}).encode()
     _say_frame(sock, F_START, start_payload)
     reply = _say_reply(sock)
@@ -1376,11 +1474,14 @@ def say_wav(filename, loop=False, gap=None):
         raise RuntimeError("sayd busy: %s" % (reply or "no reply"))
 
     with LOCK:
-        SAY["sock"] = sock
-        SAY["stop"] = ev
-        SAY["name"] = name
-        SAY["ts"] = time.time()
-        SAY["active"] = True
+        SAY_FEEDERS.append(fe)
+        SAY.update({"sock": sock, "stop": ev, "name": name,
+                    "ts": time.time(), "active": True})
+        SAY_LAST_PLAY["key"] = dedup_key
+        SAY_LAST_PLAY["ts"] = time.time()
+        nfeeder = len(SAY_FEEDERS)
+    if nfeeder > 1:
+        log("SAY warning: %d live feeder(s) before start (should be 0)" % (nfeeder - 1))
     log("SAY %s loop=%s %dms gap=%.1fs (sayd)" % (name, bool(loop), info["cycle_ms"], gap))
 
     def _connect():
@@ -1457,10 +1558,13 @@ def say_wav(filename, loop=False, gap=None):
                         log("SAY reconnect gave up after 6 attempts")
                         return
                     with LOCK:
+                        fe["sock"] = cur               # D-040：注册表同步
                         if SAY.get("stop") is ev:
                             SAY["sock"] = cur
         finally:
             with LOCK:
+                if fe in SAY_FEEDERS:
+                    SAY_FEEDERS.remove(fe)             # D-040：退出注销
                 if SAY.get("stop") is ev:
                     SAY["sock"] = None
                     SAY["stop"] = None

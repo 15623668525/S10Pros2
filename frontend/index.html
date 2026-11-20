@@ -472,7 +472,11 @@ function markSel(btn, duration_ms, loop){
 }
 
 function astop(){ clearSel(); api("/api/audio/stop",{}); }
+let PLAY_BUSY = false;   /* D-040：防双击双发（后端另有 1s 幂等窗口兜底多端同秒重复） */
 function play(a, btn){
+  if (PLAY_BUSY) return;
+  PLAY_BUSY = true;
+  setTimeout(()=>{ PLAY_BUSY = false; }, 800);
   if(a.say){
     document.getElementById("alog").textContent =
       (LOOP ? "循环播放：" : "推送播放：") + a.name + " …";
