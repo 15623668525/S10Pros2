@@ -1358,7 +1358,13 @@ def _talk_watchdog(ev):
 
 
 def talk_start():
-    """开对讲会话（幂等）；等首帧到达再返回，前端能立刻区分「成功 / 麦被抢」。"""
+    """开对讲会话（幂等）；立即返回，不等首帧（v3.5.6）。
+
+    2026-11-26 事故：原逻辑最多等 3s 首帧，公网 HTTPS 链路在等待期间断开连接，
+    前端 fetch 抛 "Failed to fetch"（"无法开始：..."），而后端其实已成功启动采集。
+    首帧改由 /api/talk/pcm 流自然承载；麦克风真打不开时 _talk_reader 会置
+    active=False，前端 status 轮询里 if(!s.talk.active) talkStop() 负责兜底。
+    """
     with TALK_LOCK:
         already = TALK["active"]
     if already:                        # 注意：先松锁再取状态，Lock 不可重入
@@ -1383,17 +1389,9 @@ def talk_start():
     threading.Thread(target=_talk_reader, args=(ev,), daemon=True).start()
     threading.Thread(target=_talk_watchdog, args=(ev,), daemon=True).start()
     log("TALK start dev=%s %dHz frame=%dB" % (TALK_DEV, TALK_RATE, TALK_FRAME))
-    t0 = time.time()
-    while time.time() - t0 < 3.0:
-        with TALK_LOCK:
-            if TALK["bytes"] > 0 or not TALK["active"]:
-                break
-        time.sleep(0.05)
+    # 不等待首帧：立即返回，避免公网 HTTPS 长响应被中断（见 docstring）
     st = talk_state()
-    if not st["active"]:
-        st["ok"] = False
-    else:
-        st["ok"] = True
+    st["ok"] = bool(st["active"])
     return st
 
 
