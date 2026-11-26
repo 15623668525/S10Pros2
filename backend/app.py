@@ -1839,6 +1839,16 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 65
     disable_nagle_algorithm = True
 
+    def setup(self):
+        # v3.5.9：TLS 握手在 handler 线程执行（get_request 用 do_handshake_on_connect=False
+        # 包装、已设 15s 超时）。公网扫描器/坏客户端握手失败或超时只废本线程，
+        # 绝不阻塞 accept 线程（16:10 事故：握手挂死 accept，队列堆 111 个连接全站超时）。
+        # 注意用 self.request：self.connection 要到 super().setup() 里才赋值。
+        conn = self.request
+        if isinstance(conn, ssl.SSLSocket) and getattr(conn, "_sslobj", None) is None:
+            conn.do_handshake()
+        super().setup()
+
     def _send(self, code, obj, ctype="application/json; charset=utf-8", extra=None, meter=True):
         body = obj if isinstance(obj, bytes) else json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -2355,20 +2365,38 @@ def main():
     log("S10YK backend listening on http://%s:%d  [auth: %s]" % (host, port, auth_s))
     # TLS 双监听：与明文共用同一 Handler/全局状态（ARMED/SAY/SHOUT 不割裂）。
     # 证书未配置时维持纯 HTTP 行为；配置后额外起 HTTPS 线程，麦克风在安全上下文可用。
-    # 增大 accept 队列（默认 5）：talk/pcm 是 chunked 长流，手机切后台/网络抖动时
-    # 客户端可能不读完就断开，服务端线程在 TLS write 上短时阻塞；默认队列 5 会被
-    # 几个这样的连接占满，导致后续所有 fetch 报 "failed to fetch"（2026-11-26 事故）。
+    # v3.5.9：TLS 握手绝不能发生在 accept 线程。
+    # 旧实现 wrap_socket(listen_socket) 让 accept() 同步做 TLS 握手——公网扫描器
+    # TCP 连上却不发 ClientHello，accept 线程即永久挂死：accept 队列堆满（16:10
+    # 事故堆了 111 个），18443 全站超时而 18090 明文正常。v3.5.5 的 backlog=128
+    # 只是延后症状。现在 get_request 只收裸 TCP，握手挪到 handler 线程（见 Handler.setup）。
     class BackendHTTPServer(ThreadingHTTPServer):
         request_queue_size = 128
         daemon_threads = True
+        tls_ctx = None                     # 非 None 时在 handler 线程做 TLS 握手
+
+        def get_request(self):
+            sock, addr = self.socket.accept()
+            if self.tls_ctx is not None:
+                sock.settimeout(15)        # 握手超时：坏连接 15s 内作废释放线程
+                sock = self.tls_ctx.wrap_socket(sock, server_side=True,
+                                                do_handshake_on_connect=False)
+            return sock, addr
+
+        def handle_error(self, request, client_address):
+            import sys as _sys
+            et, ev, _tb = _sys.exc_info()
+            if isinstance(ev, ssl.SSLError):
+                return                     # 坏握手/握手超时，公网常态噪音，静默丢弃
+            super().handle_error(request, client_address)
 
     if TLS_CERT and TLS_KEY and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(TLS_CERT, TLS_KEY)
         https = BackendHTTPServer((host, TLS_PORT), Handler)
-        https.socket = ctx.wrap_socket(https.socket, server_side=True)
+        https.tls_ctx = ctx
         threading.Thread(target=https.serve_forever, daemon=True).start()
-        log("S10YK backend HTTPS listening on https://%s:%d (SHOUT mic enabled, backlog=128)" % (host, TLS_PORT))
+        log("S10YK backend HTTPS listening on https://%s:%d (SHOUT mic enabled, backlog=128, handshake-in-handler)" % (host, TLS_PORT))
     BackendHTTPServer((host, port), Handler).serve_forever()
 
 
