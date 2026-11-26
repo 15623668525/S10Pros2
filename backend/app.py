@@ -2018,35 +2018,36 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/talk/state":
             self._send(200, talk_state())
         elif path == "/api/talk/pcm":
-            # 下行：机器人 MIC → 浏览器。chunked 原始 PCM（16k/mono/S16），浏览器边收边播。
+            # 下行：机器人 MIC → 浏览器。v3.5.7 改为短请求轮询：
+            # 原 chunked 长流在公网 HTTPS 链路上会被中途掐断（实测 20s 只传出 2.7s PCM，
+            # 手机侧"下行中断/无声"），而喊话的短 POST 稳定——公网链路对长连接不友好。
+            # 现每次请求阻塞凑满 ms 毫秒（默认 200，可传 40~500）即以 Content-Length
+            # 立即返回；无数据返回空体，前端串行轮询。语义与 /api/shout/pcm 同款。
             if not talk_active():
                 self._send(409, {"error": "talk not active"})
                 return
+            ms = 200
+            try:
+                qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                for kv in qs.split("&"):
+                    if kv.startswith("ms="):
+                        ms = min(max(int(kv[3:]), 40), 500)
+            except Exception:
+                ms = 200
             gen = talk_stream_begin()
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                while True:
-                    with TALK_LOCK:
-                        alive = TALK["active"] and TALK["stream_gen"] == gen
-                    if not alive:
-                        break
-                    data = talk_read(0.5)
-                    if not data:
-                        continue
-                    self.wfile.write(b"%X\r\n" % len(data))
-                    self.wfile.write(data)
-                    self.wfile.write(b"\r\n")
-                    self.wfile.flush()
-                    net_add(len(data) + 8)   # 下行 PCM 计入真实流量
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                deadline = time.time() + ms / 1000.0
+                want = TALK_RATE * 2 * ms // 1000     # ms 毫秒 PCM 的字节数
+                buf = bytearray()
+                while len(buf) < want and time.time() < deadline:
+                    data = talk_read(max(0.01, deadline - time.time()))
+                    if data:
+                        buf.extend(data)
+                # 不发 Connection: close：HTTP/1.1 + Content-Length 下浏览器
+                # 可复用 TLS 连接，轮询省去每次握手（实测握手开销吃掉 1/3 吞吐）
+                self._send(200, bytes(buf), ctype="application/octet-stream")
             except Exception:
-                pass                          # 客户端关闭 / 会话被停，均属正常退出
+                pass                                  # 客户端断开/会话被停，均属正常
             finally:
                 talk_stream_end()
         elif path == "/api/audio/presets":

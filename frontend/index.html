@@ -1088,30 +1088,35 @@ function talkPlayPcm(i16){
   TALK_CURSOR += n / TALK_RATE_F;
 }
 
-/* 下行流读取：fetch + ReadableStream，按 2 字节对齐拼样本（分片边界可能切在样本中间） */
+/* 下行轮询（v3.5.7）：chunked 长流在公网 HTTPS 链路上会被中途掐断
+   （实测 20s 只传到 2.7s PCM、手机无声），改为与喊话上行同款的短请求：
+   GET /api/talk/pcm?ms=200 —— 后端阻塞凑批 200ms PCM 后 Content-Length 返回，
+   前端串行循环拉取；单请求 5s 兜底超时；409=会话已结束，正常退出。 */
 async function talkDownlink(gen){
-  const ctrl = new AbortController();
-  TALK_ABORT = ctrl;
-  try{
-    const r = await fetch("/api/talk/pcm", {cache:"no-store", signal: ctrl.signal});
-    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
-    const reader = r.body.getReader();
-    let rest = new Uint8Array(0);
-    while (TALK_ON && gen === TALK_GEN){
-      const {value, done} = await reader.read();
-      if (done) break;
-      if (!value || !value.length) continue;
-      TALK_BYTES += value.length;
-      const merged = new Uint8Array(rest.length + value.length);
-      merged.set(rest, 0); merged.set(value, rest.length);
-      const usable = merged.length & ~1;               /* 偶数字节才是一个完整样本序列 */
-      if (usable >= 640){                              /* ≥20ms 才送播，减少调度次数 */
-        talkPlayPcm(new Int16Array(merged.buffer.slice(0, usable)));
-        rest = merged.slice(usable);
-      } else rest = merged;
+  while (TALK_ON && gen === TALK_GEN){
+    const ctrl = new AbortController();
+    TALK_ABORT = ctrl;
+    const timer = setTimeout(()=>ctrl.abort(), 5000);
+    let buf = null;
+    try{
+      const r = await fetch("/api/talk/pcm?ms=200", {cache:"no-store", signal: ctrl.signal});
+      if (r.status === 409) break;                    /* 后端会话已收麦，正常退出 */
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      buf = new Uint8Array(await r.arrayBuffer());
+    }catch(err){
+      if (TALK_ON && gen === TALK_GEN){               /* 网络抖动：提示并重试，不清场 */
+        talkTip("下行抖动，重连中…");
+        await new Promise(res=>setTimeout(res, 300));
+      }
+      continue;
+    }finally{
+      clearTimeout(timer);
     }
-  }catch(err){
-    if (TALK_ON && gen === TALK_GEN) talkTip("下行中断：" + (err.message || err));
+    if (buf && buf.length){
+      TALK_BYTES += buf.length;
+      const usable = buf.length & ~1;                 /* 偶数字节对齐（批式帧天然对齐） */
+      talkPlayPcm(new Int16Array(buf.buffer.slice(0, usable)));
+    }
   }
 }
 
