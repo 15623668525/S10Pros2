@@ -4,7 +4,7 @@
 >
 > 结论摘要：真因不是"厂商锁死时钟"，而是 Ubuntu 的 `chronyd-starter.sh` 把厂商加固系统误判为容器，
 > 自动给 chronyd 加 `-x`（只测不调）。`/etc/default/chrony` 的 `SYNC_IN_CONTAINER="yes"` 即官方开关，
-> 改完重启即 step -51.9 s；106 由厂商 PTP 跟随、无需改动；服务器侧 chrony 早已就绪（`allow <SITE_NET>/24`）。
+> 改完重启即 step -51.9 s；106 由厂商 PTP 跟随、无需改动；服务器侧 chrony 早已就绪（`allow <SITE_NET>`）。
 > 详见下方 §2/§4/§6 与 `操作记录.md` OPS-34、`缺陷记录.md` D-024。
 
 ## 1. 问题
@@ -21,7 +21,7 @@
 
 | 端 | 时钟来源 | 状态 |
 |---|---|---|
-| 服务器 204 | chronyd → 阿里/腾讯 NTP（stratum 2/3） | ✅ 正常，且 **NTP 服务端已就绪**：`allow <SITE_NET>/24`、`local stratum 8`（上游全断也能授时）、ufw 已放行 `123/udp from <ROBOT_IP>` |
+| 服务器 204 | chronyd → 阿里/腾讯 NTP（stratum 2/3） | ✅ 正常，且 **NTP 服务端已就绪**：`allow <SITE_NET>`、`local stratum 8`（上游全断也能授时）、ufw 已放行 `123/udp from <ROBOT_IP>` |
 | 103 业务板 | **厂商 MCU 对时机制锁死**；chronyd 已装但带 `-x`（只运行不控钟） | ❌ 快 48.8→52.6 s，`date -s` 数秒内被拉回 |
 | 106 主控板 | systemd-timesyncd 默认（`NTP=` 被注释，OPS-24 试验后已回退）；同样被厂商机制锁到 MCU 时间 | ❌ 同上 |
 

@@ -9,7 +9,7 @@ done
 echo "--- 实时遥测(一次) ---"
 timeout 6 ros2 topic echo /MOTION_INFO --once 2>&1 | head -10
 echo "--- 8554 监听者 ---"
-echo <PW> | sudo -S ss -tlnp 2>/dev/null | grep -E "8554|30003"
+echo <PW_B64> | base64 -d | sudo -S ss -tlnp 2>/dev/null | grep -E "8554|30003"
 echo "--- 厂商日志目录 ---"
 ls -lt /var/opt/robot/log/ 2>/dev/null | head -10
 echo "--- 厂商 log/system 最近 ---"
