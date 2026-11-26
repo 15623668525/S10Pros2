@@ -1,12 +1,14 @@
-# 205 板 /etc/systemd/system/s10yk-say.service（2026-11-17 18:47 版，D-038）
-# 与线上文件保持同步；线上备份：s10yk-say.service.bak.20261117
+# 205 板 /etc/systemd/system/s10yk-say.service（2026-11-26 改为 default/pipewire 共享设备）
+# 与线上文件保持同步；线上备份：~/backup_audio_20261126_134238/
 [Unit]
-Description=S10 custom voice player (sayd) - single owner of plughw:0,0
+Description=S10 custom voice player (sayd) - shared via ALSA default (pipewire)
 After=sound.target
 
 [Service]
 Type=simple
-Environment=SAYD_ALSA_DEV=plughw:0,0
+# 2026-11-26：plughw:0,0 独占设备导致别的应用无法共用；default 走 pipewire 天然混音，
+# 实测 16k/mono 双实例并发 OK（sayd + 另一 aplay 同时 RUNNING）。厂商 audio 已停用。
+Environment=SAYD_ALSA_DEV=default
 Environment=SAYD_PORT=18081
 Environment=SAYD_IDLE=1.2
 # D-038：ES8323 上电默认 Speaker/Headphone 均为 off，厂商环境由 audio_node 负责打开；
