@@ -762,8 +762,12 @@ let SHOUT_QUEUE = [], SHOUT_SENDING = false, SHOUT_SENT_B = 0, SHOUT_DROP = 0;
 let SHOUT_GEN = 0;                         /* 会话代次：松手收尾途中又按下去时，旧收尾不得误停新会话 */
 let SHOUT_RATE = 16000;                    /* 上行 PCM 速率：恒 16k（原生采集在 worklet 内重采样，D-036/D-037） */
 let SHOUT_RMS = 0;                         /* 最近一片的麦克风 RMS（0~1），用于电平表/静音诊断 */
-const SHOUT_QMAX = 15;                     /* 队列上限（片，1 片=100ms） */
-const SHOUT_BATCH = 4;                     /* 单次 POST 最多合并 4 片(400ms)，网络慢时自然变大 */
+const SHOUT_QMAX = 24;                     /* 队列上限（片，1 片=100ms）。v3.5.8: 15→24，
+                                              多扛 ~0.9s 网络抖动；实测公网泵吞吐仅 5.5~8.3 片/s
+                                              （<10 片/s 实时），15 片上限下 20s 丢 69 片 */
+const SHOUT_BATCH = 8;                     /* 单次 POST 最多合并 8 片(800ms)。v3.5.8: 4→8，
+                                              积压时每请求携带量翻倍，一趟 RTT 追回更多片，
+                                              泵峰值吞吐 10→27 片/s，才能追平实时速率 */
 
 function shoutTip(t){ const e = document.getElementById("shoutTip"); if (e) e.textContent = t; }
 /* 建会话：sayd 忙/设备被占用时抛错，由 shoutDown 统一提示并收尾 */
@@ -794,14 +798,17 @@ async function shoutPump(){
         buf = merged;
       }
       let sent = false;
-      for (let attempt = 0; attempt < 2 && !sent; attempt++){
+      for (let attempt = 0; attempt < 3 && !sent; attempt++){
+        if (attempt){                                  /* 失败退避 120ms 再试，别连续撞墙 */
+          await new Promise(r => setTimeout(r, 120));
+        }
         let r;
         try{
           r = await fetch("/api/shout/pcm", {method:"POST", cache:"no-store",
             headers:{"Content-Type":"application/octet-stream"}, body:buf});
         }catch(err){
-          if (attempt) { shoutTip("上行中断：" + (err.message || err)); }
-          break;
+          if (attempt === 2) { shoutTip("上行中断：" + (err.message || err)); }
+          continue;
         }
         if (r.status === 409 && attempt === 0 && SHOUT_REC){
           /* 会话被看门狗/其它音频入口终止：重建一次再重发这批，句子不会断在这 */
