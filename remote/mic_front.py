@@ -57,21 +57,25 @@ class SpeexNS:
         self.lib.speex_preprocess_run.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self.lib.speex_preprocess_state_destroy.argtypes = [ctypes.c_void_p]
         self.st = self.lib.speex_preprocess_state_init(self.frame, RATE)
-        # SpeexPreprocess ctl 常量
-        self.SET_DENOISE = 2
-        self.SET_AGC = 3
+        # SpeexPreprocess ctl 常量（标准 speex_preprocess.h，2026-11-26 修正）
+        # 旧代码用非标编号（DENOISE=2/AGC=3/NS=5）实际命中 SET_AGC/GET_AGC/GET_VAD，
+        # 导致 AGC 误开、抑制强度从未设置。真人 A/B 判定 L3 削语音，默认关闭；
+        # 此处仍修正为标准值，避免日后误用。
+        self.SET_DENOISE = 0
+        self.SET_AGC = 2
         self.SET_VAD = 4
-        self.SET_NOISE_SUPPRESS = 5      # 噪声抑制强度 dB（负值）
-        self.SET_DEREVERB = 12
+        self.SET_NOISE_SUPPRESS = 18     # 噪声抑制强度 dB（负值）
+        self.SET_DEREVERB = 8
         one = ctypes.c_int(1)
         zero = ctypes.c_int(0)
-        supp = ctypes.c_int(18)          # −18 dB：温和，避免人声失真（−25 偏激进）
+        supp = ctypes.c_int(-18)         # −18 dB（speex 要求负值）；真人 A/B 判定仍削语音，默认关闭 L3
         self.lib.speex_preprocess_ctl(self.st, self.SET_DENOISE, ctypes.byref(one))
         self.lib.speex_preprocess_ctl(self.st, self.SET_AGC, ctypes.byref(zero))
         self.lib.speex_preprocess_ctl(self.st, self.SET_VAD, ctypes.byref(zero))
         self.lib.speex_preprocess_ctl(self.st, self.SET_DEREVERB, ctypes.byref(zero))
         self.lib.speex_preprocess_ctl(self.st, self.SET_NOISE_SUPPRESS, ctypes.byref(supp))
-        diag("speex NS init: frame=%d rate=%d denoise=on supp=-18dB agc=off" % (self.frame, RATE))
+        diag("speex NS init: frame=%d rate=%d denoise=on supp=-18dB agc=off "
+             "(NOTE: human-voice A/B 2026-11-26 showed speech attenuated; keep L3 off)" % (self.frame, RATE))
 
     def process(self, samples):
         """samples: array('h') 长度 FRAME_SMP（须为 320 整数倍）；整块 in-place 处理。"""
