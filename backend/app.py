@@ -1150,7 +1150,8 @@ TALK_RETRY = int(os.environ.get("S10YK_TALK_RETRY", "3"))            # 麦被抢
 TALK_QMAX = 40                                                       # 下行队列上限（40×40ms=1.6s）
 TALK = {"active": False, "proc": None, "ev": None, "start_ts": 0.0, "bytes": 0,
         "preempt": 0, "preempt_total": 0, "retry": 0, "err": "",
-        "streams": 0, "stream_gen": 0, "last_read": 0.0, "why": ""}
+        "streams": 0, "stream_gen": 0, "last_read": 0.0, "why": "",
+        "no_stream_since": 0.0}   # streams 归零起点，用于无消费者收麦（与 bytes 无关）
 TALK_LOCK = threading.Lock()          # 会话态
 TALK_COND = threading.Condition()     # 下行 PCM 队列
 TALK_Q = deque()                      # 下行 PCM 帧（bytes）
@@ -1335,8 +1336,21 @@ def _talk_watchdog(ev):
         if now - start > TALK_MAX_S:
             _talk_finish("max-timeout")
             break
-        if streams == 0 and now - last_ts > TALK_IDLE_S:
-            _talk_finish("no-listener")      # 页面关了/断网，别一直占着麦
+        # 无消费者收麦：按「连续无 streams」计时，不能按 bytes 变化——
+        # 前端 fetch 失败时 streams=0 但采集线程仍在写队列，旧逻辑下麦会被无限占用
+        # （2026-11-26 事故：卡了 279s）。start 后到 talk/pcm 连上有约 1.5s 空窗，
+        # TALK_IDLE_S=20 足够覆盖，不会误伤正常对讲。
+        if streams == 0:
+            with TALK_LOCK:
+                if TALK["no_stream_since"] == 0.0:
+                    TALK["no_stream_since"] = now
+                ns_start = TALK["no_stream_since"]
+        else:
+            with TALK_LOCK:
+                TALK["no_stream_since"] = 0.0
+            ns_start = 0.0
+        if streams == 0 and now - ns_start > TALK_IDLE_S:
+            _talk_finish("no-listener")      # 页面关了/断网/前端 fetch 失败，别一直占着麦
             break
         if proc is not None and now - last_read > 5.0:
             log("TALK mic stalled 5s -> recycle")
@@ -1363,7 +1377,7 @@ def talk_start():
     with TALK_LOCK:
         TALK.update({"active": True, "ev": ev, "proc": None, "start_ts": time.time(),
                      "bytes": 0, "preempt": 0, "retry": 0, "err": "",
-                     "last_read": time.time(), "why": ""})
+                     "last_read": time.time(), "why": "", "no_stream_since": 0.0})
     with TALK_COND:
         TALK_Q.clear()
     threading.Thread(target=_talk_reader, args=(ev,), daemon=True).start()
@@ -2342,14 +2356,21 @@ def main():
     log("S10YK backend listening on http://%s:%d  [auth: %s]" % (host, port, auth_s))
     # TLS 双监听：与明文共用同一 Handler/全局状态（ARMED/SAY/SHOUT 不割裂）。
     # 证书未配置时维持纯 HTTP 行为；配置后额外起 HTTPS 线程，麦克风在安全上下文可用。
+    # 增大 accept 队列（默认 5）：talk/pcm 是 chunked 长流，手机切后台/网络抖动时
+    # 客户端可能不读完就断开，服务端线程在 TLS write 上短时阻塞；默认队列 5 会被
+    # 几个这样的连接占满，导致后续所有 fetch 报 "failed to fetch"（2026-11-26 事故）。
+    class BackendHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 128
+        daemon_threads = True
+
     if TLS_CERT and TLS_KEY and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(TLS_CERT, TLS_KEY)
-        https = ThreadingHTTPServer((host, TLS_PORT), Handler)
+        https = BackendHTTPServer((host, TLS_PORT), Handler)
         https.socket = ctx.wrap_socket(https.socket, server_side=True)
         threading.Thread(target=https.serve_forever, daemon=True).start()
-        log("S10YK backend HTTPS listening on https://%s:%d (SHOUT mic enabled)" % (host, TLS_PORT))
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+        log("S10YK backend HTTPS listening on https://%s:%d (SHOUT mic enabled, backlog=128)" % (host, TLS_PORT))
+    BackendHTTPServer((host, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

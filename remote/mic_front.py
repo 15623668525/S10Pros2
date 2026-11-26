@@ -43,8 +43,9 @@ import subprocess
 import sys
 import time
 
-import numpy as np
-from scipy.signal import butter, iirnotch, lfilter
+# 注意：故意不 import numpy/scipy —— 业务板上二者冷启动 import 约 2.84s，
+# 会把首帧推过后端 talk_start() 的 3s 等待窗口。滤波器系数已离线算好固化在
+# 下方 BIQUAD_COEFFS，运行时纯 Python DF-II 递推，零第三方依赖、启动 <0.1s。
 
 RATE = 16000
 PERIOD_MS = int(os.environ.get("MIC_PERIOD_MS", "40"))
@@ -67,7 +68,65 @@ def diag(msg):
     sys.stderr.flush()
 
 
-# ---------- 二阶高通 + 双陷波（scipy lfilter，跨帧 zi 状态）----------
+# ---------- 二阶高通 + 双陷波（纯 Python DF-II，系数固化，跨帧状态）----------
+# 系数由 scipy 离线算出后固化（fs=16000）：避免运行时 import scipy 拖慢首帧。
+#   HP120 : butter(2,120,highpass,fs=16000)
+#   N224  : iirnotch(224,Q=25,fs=16000)
+#   N244  : iirnotch(244,Q=25,fs=16000)
+# a0 归一化为 1。改 MIC_HP_HZ / MIC_NOTCH_HZ / MIC_NOTCH_Q 时若非默认组合，
+# 惰性 import scipy 现算系数（仅该情形付出 import 成本）。
+_BIQUAD_PRESET = {
+    ("hp", 120.0): (
+        [0.967227282715, -1.93445456543, 0.967227282715],
+        [1.0, -1.93338022588, 0.935528904979]),
+    ("notch", 224.0, 25.0): (
+        [0.998243795978, -1.98876839058, 0.998243795978],
+        [1.0, -1.98876839058, 0.996487591955]),
+    ("notch", 244.0, 25.0): (
+        [0.998087291600, -1.98701795362, 0.998087291600],
+        [1.0, -1.98701795362, 0.996174583200]),
+}
+
+
+def _coeffs(kind, freq, q=25.0):
+    """取二阶节 (b0,b1,b2,a1,a2)；默认组合查表，否则惰性用 scipy 算。"""
+    key = ("hp", freq) if kind == "hp" else ("notch", freq, q)
+    if key in _BIQUAD_PRESET:
+        b, a = _BIQUAD_PRESET[key]
+    else:
+        from scipy.signal import butter, iirnotch   # 非默认参数才触发
+        if kind == "hp":
+            b, a = butter(2, freq, btype="highpass", fs=RATE)
+        else:
+            b, a = iirnotch(freq, q, fs=RATE)
+    a0 = a[0]
+    return (b[0] / a0, b[1] / a0, b[2] / a0, a[1] / a0, a[2] / a0)
+
+
+class _Biquad:
+    """转置直接 II 型二阶节，状态 s1/s2 跨帧保持。"""
+    __slots__ = ("b0", "b1", "b2", "a1", "a2", "s1", "s2")
+
+    def __init__(self, coeffs):
+        self.b0, self.b1, self.b2, self.a1, self.a2 = coeffs
+        self.s1 = self.s2 = 0.0
+
+    def process_into(self, src, dst):
+        """src/dst: array('h')；逐样本递推，结果写 dst（in-place 语义）。"""
+        b0, b1, b2, a1, a2 = self.b0, self.b1, self.b2, self.a1, self.a2
+        s1, s2 = self.s1, self.s2
+        for i, x in enumerate(src):
+            y = b0 * x + s1
+            s1 = b1 * x - a1 * y + s2
+            s2 = b2 * x - a2 * y
+            if y > 32767:
+                y = 32767
+            elif y < -32768:
+                y = -32768
+            dst[i] = int(y)
+        self.s1, self.s2 = s1, s2
+
+
 class FilterChain:
     """对选路后的 mono 施加：二阶 Butterworth 高通 + 若干二阶 IIR 陷波。
 
@@ -75,36 +134,30 @@ class FilterChain:
       但对可懂度无碍；设 MIC_HP_HZ=0 可关闭。
     - 陷波默认 224/244Hz（Q=25）：电机基频线谱，邻带能量是语音带 15-29 倍；
       陷波带宽约 f0/Q≈9Hz，语音带 500-3kHz 完全不动（无损）。
-    - zi 状态跨帧保持，lfilter 按帧递推，无块边界效应，流式延迟 0。
+    - 纯 Python DF-II，状态跨帧保持，无块边界效应，流式延迟 0，启动 <0.1s。
     """
     def __init__(self, hp_hz=HP_HZ, notch_hz=NOTCH_HZ, q=NOTCH_Q):
-        self.sections = []       # [(b, a, zi), ...]
+        self.sections = []       # [_Biquad, ...]
         if hp_hz and hp_hz > 0:
-            b, a = butter(2, hp_hz, btype="highpass", fs=RATE)
-            self.sections.append([b, a, np.zeros(max(len(a), len(b)) - 1)])
+            self.sections.append(_Biquad(_coeffs("hp", hp_hz)))
         for f in notch_hz:
             if f and f > 0:
-                b, a = iirnotch(f, q, fs=RATE)
-                self.sections.append([b, a, np.zeros(max(len(a), len(b)) - 1)])
+                self.sections.append(_Biquad(_coeffs("notch", f, q)))
         desc = []
         if hp_hz and hp_hz > 0:
             desc.append("HP%.0f" % hp_hz)
         desc += ["N%.0f" % f for f in notch_hz if f and f > 0]
-        diag("filter chain init: %s q=%.0f sections=%d (voice band 500-3k untouched)"
+        diag("filter chain init: %s q=%.0f sections=%d (pure-python, voice band 500-3k untouched)"
              % ("+".join(desc) if desc else "NONE", q, len(self.sections)))
 
     def process(self, samples):
         """samples: array('h') 长度 FRAME_SMP；返回滤波后等长 array('h')。"""
-        x = np.frombuffer(samples.tobytes(), dtype="<i2").astype(np.float64)
-        y = x
+        cur = samples
         for sec in self.sections:
-            b, a, zi = sec
-            y, zi = lfilter(b, a, y, zi=zi)
-            sec[2] = zi
-        y = np.clip(y, -32768, 32767).astype("<i2")
-        out = array.array("h")
-        out.frombytes(y.tobytes())
-        return out
+            out = array.array("h", [0]) * len(cur)
+            sec.process_into(cur, out)
+            cur = out
+        return cur
 
 
 # ---------- speex 降噪（ctypes 直调 libspeexdsp，零 pip 依赖）----------
