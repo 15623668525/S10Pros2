@@ -747,8 +747,23 @@ def audio_bootstrap():
         log("audio bootstrap error: %r" % e)
 
 
+def _is_local_say():
+    """落盘模式：S10YK_SAY_HOST 未设或为 local 时，业务板命令本机直执行（不再经 SSH）"""
+    return (not SAY_HOST) or SAY_HOST.strip().lower() == "local"
+
+
 def _ssh103(cmd, timeout=8):
-    """在 103 业务板上执行一条命令（免密钥通道），返回 (rc, stdout, stderr)"""
+    """在 103 业务板上执行一条命令；local 模式本机直跑，否则走 SSH 免密通道。返回 (rc, stdout, stderr)"""
+    if _is_local_say():
+        try:
+            r = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=timeout)
+            return (r.returncode,
+                    (r.stdout or b"").decode("utf-8", "ignore").strip(),
+                    (r.stderr or b"").decode("utf-8", "ignore").strip())
+        except subprocess.TimeoutExpired:
+            return (124, "", "timeout")
+        except Exception as e:
+            return (127, "", repr(e))
     r = subprocess.run(["ssh", "-i", SSH_KEY,
                         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                         "-o", "ConnectTimeout=4", "-o", "LogLevel=ERROR",
@@ -1229,6 +1244,12 @@ def _talk_cmd():
 
 
 def _talk_spawn():
+    if _is_local_say():
+        # 落盘模式：本机直起采集进程（mic_front.py 路径不变）
+        return subprocess.Popen(["bash", "-c", _talk_cmd()],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                bufsize=0)
     cmd = ["ssh", "-i", SSH_KEY,
            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
            "-o", "ConnectTimeout=4", "-o", "LogLevel=ERROR",

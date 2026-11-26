@@ -1,0 +1,16 @@
+[Unit]
+Description=S10YK person detect & snapshot (onboard 103)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/s10yk/venv/bin/python /opt/s10yk/backend/person_detect.py
+Environment=S10YK_RTSP_BASE=rtsp://127.0.0.1:8554
+Environment=PERSON_THREADS=4
+Environment=PERSON_FPS=2
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

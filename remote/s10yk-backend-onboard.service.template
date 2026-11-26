@@ -1,0 +1,21 @@
+[Unit]
+Description=S10YK backend (onboard 103, standalone)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=S10YK_SAY_HOST=local
+Environment=S10YK_ASSET_DIR=/opt/s10yk/assets
+Environment=S10YK_RTSP_BASE=rtsp://127.0.0.1:8554
+Environment=S10YK_PORT=18090
+Environment=S10YK_TLS_CERT=/opt/s10yk/certs/server.crt
+Environment=S10YK_TLS_KEY=/opt/s10yk/certs/server.key
+Environment=S10YK_TOKEN=__S10YK_TOKEN__
+Environment=HOME=/root
+WorkingDirectory=/opt/s10yk/backend
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec python3 /opt/s10yk/backend/app.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
