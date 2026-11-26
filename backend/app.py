@@ -87,6 +87,62 @@ AUTH_TTL = int(os.environ.get("S10YK_AUTH_TTL", "604800"))  # 7 天
 AUTH_OPEN = ("/", "/index.html", "/favicon.ico", "/api/auth", "/api/login", "/api/bw",
              "/shout-processor.js")
 
+# ---- 来源频率限制（v3.5.10，最简单滑动窗口）----
+# 背景：18090/18443 经 ufw 直接对公网开放（不经 frp，后端能看到真实对端 IP），
+# 扫描器/爆破工具可高频请求拖垮 handler 线程。按对端 IP 做 2s 滑动窗口计数，
+# 超限返回 429 并断连。内网/回环地址完全豁免（现场遥控、SSH 隧道内访问不受影响）。
+# 阈值依据：前端峰值 ≈ 27 请求/s（摇杆保活 10 + 状态轮询 2 + 对讲上下行 15），
+# 120/2s = 平均 60/s，留 2 倍余量；公网扫描器数百 req/s 会被立刻挡住。
+RL_WINDOW_S = float(os.environ.get("S10YK_RL_WINDOW", "2"))
+RL_MAX = int(os.environ.get("S10YK_RL_MAX", "120"))   # 单 IP 单窗口最大请求数
+RL_MAXIPS = 1024          # 追踪 IP 数上限（防 dict 膨胀），满了淘汰最久未活跃项
+_RL = {}                  # {ip: deque([ts, ...])}，_RL_LOCK 保护
+_RL_LOCK = threading.Lock()
+
+
+def _is_private_ip(ip):
+    """内网/回环豁免：10.x / 127.x / 192.168.x / 172.16-31.x / IPv6 回环与映射地址。"""
+    ip = (ip or "").strip()
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    if ip in ("::1", ""):
+        return True
+    if ip.startswith(("10.", "127.", "192.168.")):
+        return True
+    if ip.startswith("172."):
+        try:
+            n2 = int(ip.split(".")[1])
+            return 16 <= n2 <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def rate_limit(ip):
+    """返回 True=放行（并记账），False=超限（调用方回 429）。"""
+    if _is_private_ip(ip):
+        return True
+    now = time.time()
+    cut = now - RL_WINDOW_S
+    with _RL_LOCK:
+        dq = _RL.get(ip)
+        if dq is None:
+            if len(_RL) >= RL_MAXIPS:
+                # 淘汰窗口最早（最久不活跃）的项
+                try:
+                    oldest = min(_RL, key=lambda k: _RL[k][0] if _RL[k] else 0)
+                    del _RL[oldest]
+                except ValueError:
+                    pass
+            dq = _RL[ip] = deque()
+        while dq and dq[0] < cut:
+            dq.popleft()
+        if len(dq) >= RL_MAX:
+            return False
+        dq.append(now)
+        return True
+
+
 # ---- 带宽测速（REQ-029）：预生成固定大小数据块，前端计时下载算下行带宽 ----
 BW_BLOCK = b"\0" * (512 * 1024)   # 512 KiB，够平滑又不过度占流量
 
@@ -1886,6 +1942,13 @@ class Handler(BaseHTTPRequestHandler):
     def _deny(self):
         self._send(401, {"error": "unauthorized", "auth": True})
 
+    def _rate_deny(self):
+        """v3.5.10：来源频率超限。必须断连——POST 未读 body 时连接流已失步，
+        keep-alive 复用会把下一个请求解析进垃圾里。"""
+        self.close_connection = True
+        self._send(429, {"error": "rate limited"},
+                   extra={"Connection": "close"}, meter=False)
+
     def _meter_request(self):
         """REQ-029：统计前端→后端的上行请求字节（请求行 + 请求头 + 请求体），
         纳入 net.bps 双向流量窗口。覆盖控制/音频/状态/video 等全部 HTTP 交互。"""
@@ -1914,6 +1977,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         global ARMED
         self._meter_request()   # REQ-029：计入上行请求字节（全部交互）
+        if not rate_limit(self.client_address[0] if self.client_address else ""):
+            log("RATE LIMIT GET %s from %s" % (self.path.split("?")[0][:60],
+                                               self.client_address[0]))
+            self._rate_deny()
+            return
         path = self.path.split("?")[0]
         # v2.7 鉴权：页面本身放行（登录层在前端），其余 /api/* 必须带 token
         if path not in AUTH_OPEN and not self._auth_ok():
@@ -2120,6 +2188,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global ARMED, NAV_CMD, NAV_LAST_TS, GEAR_IDX, SLEEP_REQ, SLEEP_REQ_TS
         self._meter_request()   # REQ-029：计入上行请求字节（控制/音频等指令）
+        # v3.5.10：限流检查必须放在读 body 之前（8MB 上传别浪费在超限来源上）
+        if not rate_limit(self.client_address[0] if self.client_address else ""):
+            log("RATE LIMIT POST %s from %s" % (self.path.split("?")[0][:60],
+                                                self.client_address[0]))
+            self._rate_deny()
+            return
         path = self.path.split("?")[0]
         # 喊话音频上传是二进制 body（WAV / PCM），不走 JSON 解析
         if path in ("/api/shout/clip", "/api/shout/pcm"):
