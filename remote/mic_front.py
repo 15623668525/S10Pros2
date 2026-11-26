@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MIC 三通道前端：选能量最大路（L2）+ speex 降噪（L3），输出单声道 raw 到 stdout。
+"""MIC 三通道前端：选能量最大路（L2）+ 陷波高通（L3a）+ speex 降噪（L3b，默认关），
+输出单声道 raw 到 stdout。
 
 背景（OPS-91 / 2026-11-26）：
   本体 USB 麦阵列是 6ch/16k，实测有效独立通道只有 ch0/ch1/ch2（ch2==ch3，ch4/ch5 近静音），
   ch1(FL→FR) 比 ch0 高 5.7dB。原对讲下行 arecord -c 1 固定取 ch0，浪费了更强拾音点。
-  本脚本采前 3 路，按帧选能量最大路（带滞回防抖），可选 speex 降噪，仍按 16k/mono/S16_LE
+  本脚本采前 3 路，按帧选能量最大路（带滞回防抖），再经「二阶高通 + 224/244Hz 双陷波」
+  滤掉电机线谱/结构低频（语音带 500-3kHz 零损），可选 speex 降噪，仍按 16k/mono/S16_LE
   输出，后端与前端零改动。
 
+设计依据（录音样本无效性诊断_20261126.md）：
+  电机噪声是 224/244Hz 基频 + 离散谐波线，基频邻带能量是语音带的 15-29 倍；
+  speex/谱减/Wiener/MMSE 在低输入 SNR 下均劣化语音，唯一无损处理是陷波(基频)+高通。
+  L3a（本版新增）即该无损链路；L3b（speex）经真人 A/B 判定削语音，维持默认关。
+
 用法（由后端 _talk_cmd() 经 SSH 调用）：
-  stdbuf -o0 python3 mic_front.py [--no-denoise] [--fixed 1]
+  stdbuf -o0 python3 mic_front.py [--no-denoise] [--no-filter] [--fixed 1]
 
 参数：
-  --no-denoise   关闭 speex 降噪（A/B 对比用）
+  --no-denoise   关闭 speex 降噪（默认即关，A/B 对比用）
+  --no-filter    关闭高通+陷波（A/B 对照组 / 一键回退）
   --fixed N      固定取第 N 路（0/1/2），不选路（A/B 对比用）；默认自动选路
 环境变量：
   MIC_PERIOD_MS  帧长 ms，默认 40（须与后端 TALK_PERIOD_US/1000 一致）
   MIC_HYST_DB    选路滞回 dB，默认 3.0（新路需高当前路 3dB 才切，防抖）
   MIC_HOLD       连续多少帧满足才切，默认 3
   MIC_DEV        arecord 设备，默认 plughw:1,0
+  MIC_FILTER     设 0 关闭滤波（等价 --no-filter），默认 1 开
+  MIC_HP_HZ      高通截止 Hz，默认 120（0=关闭高通）
+  MIC_NOTCH_HZ   陷波频率列表（逗号分隔），默认 224,244（空=关闭陷波）
+  MIC_NOTCH_Q    陷波 Q 值，默认 25
 输出：stdout 二进制 S16_LE 16k 单声道；诊断写 stderr。
 """
 import argparse
@@ -31,6 +43,9 @@ import subprocess
 import sys
 import time
 
+import numpy as np
+from scipy.signal import butter, iirnotch, lfilter
+
 RATE = 16000
 PERIOD_MS = int(os.environ.get("MIC_PERIOD_MS", "40"))
 FRAME_SMP = RATE * PERIOD_MS // 1000          # 640 samples @40ms
@@ -39,10 +54,57 @@ HYST_DB = float(os.environ.get("MIC_HYST_DB", "3.0"))
 HOLD = int(os.environ.get("MIC_HOLD", "3"))
 DEV = os.environ.get("MIC_DEV", "plughw:1,0")
 
+# 滤波链配置：默认开（无损），--no-filter / MIC_FILTER=0 一键回退
+FILTER_ON = os.environ.get("MIC_FILTER", "1") != "0"
+HP_HZ = float(os.environ.get("MIC_HP_HZ", "120"))
+_notch_raw = os.environ.get("MIC_NOTCH_HZ", "224,244").strip()
+NOTCH_HZ = [float(x) for x in _notch_raw.split(",") if x.strip()]
+NOTCH_Q = float(os.environ.get("MIC_NOTCH_Q", "25"))
+
 # 写 stderr 的诊断（不污染 stdout 的 PCM）
 def diag(msg):
     sys.stderr.write("[mic_front] %s\n" % msg)
     sys.stderr.flush()
+
+
+# ---------- 二阶高通 + 双陷波（scipy lfilter，跨帧 zi 状态）----------
+class FilterChain:
+    """对选路后的 mono 施加：二阶 Butterworth 高通 + 若干二阶 IIR 陷波。
+
+    - 高通默认 120Hz：压制结构传导低频/风噪，语音基频（男 85-155Hz）有少量损失，
+      但对可懂度无碍；设 MIC_HP_HZ=0 可关闭。
+    - 陷波默认 224/244Hz（Q=25）：电机基频线谱，邻带能量是语音带 15-29 倍；
+      陷波带宽约 f0/Q≈9Hz，语音带 500-3kHz 完全不动（无损）。
+    - zi 状态跨帧保持，lfilter 按帧递推，无块边界效应，流式延迟 0。
+    """
+    def __init__(self, hp_hz=HP_HZ, notch_hz=NOTCH_HZ, q=NOTCH_Q):
+        self.sections = []       # [(b, a, zi), ...]
+        if hp_hz and hp_hz > 0:
+            b, a = butter(2, hp_hz, btype="highpass", fs=RATE)
+            self.sections.append([b, a, np.zeros(max(len(a), len(b)) - 1)])
+        for f in notch_hz:
+            if f and f > 0:
+                b, a = iirnotch(f, q, fs=RATE)
+                self.sections.append([b, a, np.zeros(max(len(a), len(b)) - 1)])
+        desc = []
+        if hp_hz and hp_hz > 0:
+            desc.append("HP%.0f" % hp_hz)
+        desc += ["N%.0f" % f for f in notch_hz if f and f > 0]
+        diag("filter chain init: %s q=%.0f sections=%d (voice band 500-3k untouched)"
+             % ("+".join(desc) if desc else "NONE", q, len(self.sections)))
+
+    def process(self, samples):
+        """samples: array('h') 长度 FRAME_SMP；返回滤波后等长 array('h')。"""
+        x = np.frombuffer(samples.tobytes(), dtype="<i2").astype(np.float64)
+        y = x
+        for sec in self.sections:
+            b, a, zi = sec
+            y, zi = lfilter(b, a, y, zi=zi)
+            sec[2] = zi
+        y = np.clip(y, -32768, 32767).astype("<i2")
+        out = array.array("h")
+        out.frombytes(y.tobytes())
+        return out
 
 
 # ---------- speex 降噪（ctypes 直调 libspeexdsp，零 pip 依赖）----------
@@ -125,16 +187,20 @@ def pick_channel(frame, cur, above, hyst_lin, fixed=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-denoise", action="store_true")
+    ap.add_argument("--no-filter", action="store_true")
     ap.add_argument("--fixed", type=int, default=None, choices=[0, 1, 2])
     args = ap.parse_args()
 
     ns = None if args.no_denoise else SpeexNS()
+    flt = None if (args.no_filter or not FILTER_ON) else FilterChain()
     hyst_lin = 10 ** (HYST_DB / 10.0)
     cmd = ["arecord", "-q", "-D", DEV, "-f", "S16_LE", "-r", str(RATE),
            "-c", str(NCH), "-t", "raw", "-B", "200000", "-F",
            str(PERIOD_MS * 1000), "-"]
-    diag("spawn: %s | nch=%d frame=%dsmp hyst=%.1fdB hold=%d fixed=%s denoise=%s"
-         % (" ".join(cmd), NCH, FRAME_SMP, HYST_DB, HOLD, args.fixed, not args.no_denoise))
+    diag("spawn: %s | nch=%d frame=%dsmp hyst=%.1fdB hold=%d fixed=%s "
+         "denoise=%s filter=%s"
+         % (" ".join(cmd), NCH, FRAME_SMP, HYST_DB, HOLD, args.fixed,
+            not args.no_denoise, flt is not None))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     outstdout = sys.stdout.buffer
     buf = bytearray()
@@ -166,6 +232,8 @@ def main():
                     switches += 1
                     diag("switch ch%d -> ch%d (t=%.1fs)" % (cur, newcur, time.time() - t0))
                 cur = newcur
+                if flt is not None:
+                    mono = flt.process(mono)
                 if ns is not None:
                     mono = ns.process(mono)
                 if sys.byteorder != "little":
@@ -180,8 +248,8 @@ def main():
             p.terminate()
         except Exception:
             pass
-        diag("exit frames=%d dur=%.1fs switches=%d final_ch=%d" %
-             (frames, time.time() - t0, switches, cur))
+        diag("exit frames=%d dur=%.1fs switches=%d final_ch=%d filter=%s" %
+             (frames, time.time() - t0, switches, cur, flt is not None))
         if ns is not None:
             ns.close()
 
