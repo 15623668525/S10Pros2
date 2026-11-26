@@ -1131,6 +1131,16 @@ def shout_state():
 # 生灭，断了就重开——顺带能精确统计「MIC 被抢占」次数（busy / 中途被夺 / USB 复位）。
 TALK_DEV = os.environ.get("S10YK_TALK_DEV", "plughw:1,0")   # card1 = USB 麦阵列
 TALK_RATE = int(os.environ.get("S10YK_TALK_RATE", "16000"))
+# OPS-91（2026-11-26）：三咪头前端（选能量最大路 + speex 降噪）。
+# MIC 6ch 实测仅 ch0/ch1/ch2 有效，ch1 比 ch0 强 5.7dB；前端脚本在业务板上处理，
+# 仍输出 16k/mono/S16_LE，帧结构/队列/前端零改动。
+# 一键回退：设 S10YK_TALK_FRONT=0 → 恢复原样 arecord -c 1（固定 ch0）。
+TALK_FRONT = os.environ.get("S10YK_TALK_FRONT", "1") != "0"
+TALK_FRONT_SCRIPT = os.environ.get("S10YK_TALK_FRONT_SCRIPT", "/home/user/mic_front.py")
+# L3 降噪默认关闭：实测 speex 对持续音源衰减 66%（纯 1kHz 正弦 RMS 5657→1944），
+# 真实人声虽断续、理论影响较小，但未做真人 A/B 前不默认启用，避免削语音。
+# 现场验证通过后在 systemd 里设 S10YK_TALK_DENOISE=1 即可开启，无需改代码。
+TALK_DENOISE = os.environ.get("S10YK_TALK_DENOISE", "0") != "0"
 TALK_PERIOD_US = int(os.environ.get("S10YK_TALK_PERIOD", "40000"))   # 40ms 一帧，降延迟
 TALK_BUF_US = int(os.environ.get("S10YK_TALK_BUFFER", "200000"))     # 采集缓冲 200ms
 TALK_FRAME = max(256, TALK_RATE * 2 * TALK_PERIOD_US // 1000000)     # 1280B @16k/mono/40ms
@@ -1147,7 +1157,16 @@ TALK_Q = deque()                      # 下行 PCM 帧（bytes）
 
 
 def _talk_cmd():
-    """业务板上的采集命令：stdbuf -o0 关掉 stdio 缓冲（否则 4KB 块缓冲白加 128ms 延迟）。"""
+    """业务板上的采集命令：stdbuf -o0 关掉 stdio 缓冲（否则 4KB 块缓冲白加 128ms 延迟）。
+
+    OPS-91：默认走 mic_front.py（3ch 选路 + 降噪），输出仍是 mono raw；
+    S10YK_TALK_FRONT=0 可回退到原 arecord -c 1 单路采集。
+    """
+    if TALK_FRONT:
+        cmd = "exec stdbuf -o0 python3 %s" % TALK_FRONT_SCRIPT
+        if not TALK_DENOISE:
+            cmd += " --no-denoise"
+        return cmd
     return ("exec stdbuf -o0 arecord -q -D %s -f S16_LE -r %d -c 1 -t raw "
             "-B %d -F %d -" % (TALK_DEV, TALK_RATE, TALK_BUF_US, TALK_PERIOD_US))
 
@@ -1410,7 +1429,8 @@ def talk_state():
                 "preempt_total": int(TALK["preempt_total"]),  # 后端启动以来累计
                 "err": TALK["err"], "why": TALK["why"],
                 "streams": int(TALK["streams"]),
-                "rate": TALK_RATE, "frame": TALK_FRAME}
+                "rate": TALK_RATE, "frame": TALK_FRAME,
+                "front": bool(TALK_FRONT), "denoise": bool(TALK_FRONT and TALK_DENOISE)}
 
 
 def say_wav(filename, loop=False, gap=None):
