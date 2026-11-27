@@ -1890,7 +1890,16 @@ def person_voice_watcher():
         try:
             st = person_alert_state()
             if st and st["ts"] > PERSON["spoken_ts"]:
-                if time.time() - PERSON["last_speak"] >= PERSON_VOICE_GAP:
+                # 对讲/喊话进行中静默跳过（2026-11-27 落盘后实测：现场人员频繁触发预警，
+                # say_wav 内部的三路互斥会把刚建立 4s 的双向对讲直接杀掉）。
+                # 跳过仍标记已处理，与下方 GAP 静默跳过同款语义；对讲结束后新预警正常播报。
+                with LOCK:
+                    busy = bool(SHOUT.get("active"))
+                with TALK_LOCK:
+                    busy = busy or bool(TALK.get("active"))
+                if busy:
+                    PERSON["spoken_ts"] = st["ts"]
+                elif time.time() - PERSON["last_speak"] >= PERSON_VOICE_GAP:
                     name = "person_alert_%s.wav" % (st.get("voice_key") or "front")
                     try:
                         say_wav(name)          # 阻塞至播完
