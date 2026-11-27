@@ -1,157 +1,44 @@
-# S10ykApp — 山猫 S10 Pro 机器狗远程控制台
+# S10Pros2 — S10 Pro 机器狗控制台（服务器版 + 单机版）
 
-基于 Web 的四足机器狗（云深处 山猫 S10 Pro）远程控制系统：手机/PC 打开浏览器即可完成**运动遥控、四路视频监控、人员检测、语音播报、一键喊话（实时）、双向对讲**。后端刻意做成 **Python 纯标准库 + rclpy**（目标板无外网、不能 pip），前端为**零构建单文件页面**，整体极易部署与维护。
+一个仓库，两个子项目，同一份代码基线（v3.5.12，2026-11-27）按部署形态分目录维护：
 
-> 当前版本：**v3.5.10**（2026-11-26）· 详细演进见 [`docs/版本记录.md`](docs/版本记录.md)
+| 子目录 | 版本 | 应用主体位置 | 外部依赖 |
+|---|---|---|---|
+| [`S10ykServer/`](S10ykServer/) | 服务器版 | 云服务器（`/opt/s10yk/`，18090/18443） | 经 zenoh-bridge/frp 链路远程控制本体，依赖公网链路 |
+| [`S10ykOnboard/`](S10ykOnboard/) | 单机版 | 机器狗本体业务板 103（`/opt/s10yk/`） | **零外部依赖**，DDS rclpy/drdds 直连 NOS 106，开机自启 |
 
-## 功能总览
+两个子目录各有一份 README（架构、目录结构、部署要点、资源占用摘要）。
 
-| 模块 | 能力 |
-|---|---|
-| 运动控制 | 站立/趴下/软急停、**休眠/唤醒两态切换**（趴下+关节阻尼的协议等效休眠，唤醒自动站立）、步态切换（基础/平地/楼梯）、**圆形八向方向盘**（前进/后退/左转/右转 + 前进中左右转，拖动中不松手拖回正上即恢复直行）、ARM 使能滑动开关、一键急停（归零+断使能+软急停）、速度限幅与 600ms 断流保护 |
-| 视频监控 | 4 路 RTSP 摄像头（前/后/左/右）转 MJPEG 分页显示，视频开关统一滑动开关样式 |
-| 人员检测 | 204 侧独立服务 `s10yk-persond`：4 路 RTSP 抽帧（3fps/路）→ YOLOv8n person（1280@0.35，有效 ≈30m）→ 命中抓拍（当前帧 + 前 1s 环形缓冲）→ 前端「人员检测」页（总人数/当前人数/存储配额/最新抓拍，1Hz 刷新）+ 横幅预警 + 4 方位语音播报（25s 最小间隔）；4 路检测开关独立开/关（关=释放该路 RTSP 连接省 CPU/带宽）；抓拍保留 2 天、配额按 3 天预估自动管理（REQ-047/048/049，v3.2~v3.4） |
-| 语音播报 | 自定义音频（16k/mono WAV/MP3）经板端 sayd 实时推流播放，支持停止与循环 |
-| 一键喊话 | 手机麦克风采音 → 后端 → 机器人扬声器**边说边播**（100ms 分片、HTTP keep-alive、丢旧保延迟）；原生采样率采集 + worklet 内重采样 16k 兼顾兼容性与带宽 |
-| 双向对讲 | 机器人麦克风（6ch 阵列）→ 浏览器实时收听 + 手机→机器人实时喊话；**MIC 被抢占自动重连与计数**（前端常显） |
-| 遥测回显 | 运动状态、步态、速度、机身高度、里程、电量，500ms 轮询 |
-| 诊断工具 | 声卡占用体检、麦克风电平表/三阶段自检、链路探活、NTP 时钟核查、UWB 定位话题验证等 |
+## 当前运行形态
 
-## 总体架构
+单机版已全栈落盘业务板并接管（2026-11-27 P5 切换完成）：103 板 `s10yk-backend` + `s10yk-persond` + `s10yk-say` 开机自启；204 侧组件停用待命（回滚：103 `disable --now` → 204 `enable --now`）。
 
-```
-┌──────────── 手机/PC 浏览器（Chrome，HTTPS）────────────┐
-│        frontend/index.html（单文件：摇杆/视频/语音）      │
-└──────────────────────┬─────────────────────────────────┘
-                       │ HTTP/JSON + Cookie 鉴权 + PCM 流（keep-alive）
-┌──────────────────────▼─────────────────────────────────┐
-│  云服务器  backend/app.py + person_detect.py              │
-│  · 18090 明文 / 18443 TLS（自签 SAN 证书）单实例双监听     │
-│  · S10Bridge：ROS2/zenoh 运动控制与遥测                   │
-│  · PERSOND：4 路 RTSP → YOLOv8n 人员检测（抓拍/预警/播报） │
-│  · 摄像头代理：RTSP → MJPEG                               │
-│  · SHOUT：上行喊话会话（看门狗/代次保护/互斥）             │
-│  · TALK：下行对讲（SSH+arecord 采集、chunked 推流、        │
-│    MIC 抢占检测与自动重开）                                │
-└──────┬──────────────────────┬───────────────────────────┘
-       │ zenoh (7447)         │ ssh / TCP 18081
-┌──────▼──────────┐   ┌──────▼────────────────────────┐
-│ 机器狗 NOS 主板  │   │ 机器狗业务板  remote/sayd.py     │
-│ ROS2 Jazzy      │   │ START/F_PCM/F_STOP 帧协议       │
-│ /MOTION_* /GAIT │   │ → aplay -D plughw:0,0 (ES8323) │
-└─────────────────┘   └────────────────────────────────┘
-```
+## 硬件资源占用（实测 2026-11-27，详见各子项目 docs/硬件资源占用调研_20261127.md）
 
-## 仓库结构
+| 形态 | 内存占用 | CPU 占用 |
+|---|---|---|
+| 服务器版·云侧（48核/128GB） | ≈140 MB | <1.5 核（检测满载估算） |
+| 服务器版·板侧（轻量件） | ≈135 MB | <0.2 核 |
+| 单机版·板上全栈（8×A55/15.7GB） | ≈1.05 GB | ≈1.3–1.5 核（persond 占 1.3 核持续） |
 
-```
-S10ykApp/
-├── backend/                 # 控制台后端（云服务器）
-│   ├── app.py               # 全部后端逻辑（HTTP/TLS、ROS2 桥、喊话、对讲、代理）
-│   ├── person_detect.py     # 人员检测服务（REQ-047/048/049：4路RTSP+YOLOv8n，204 侧独立服务 s10yk-persond）
-│   └── s10yk.service        # 控制台 systemd 单元（人员检测的 s10yk-persond 单元见下方部署说明，未入库）
-├── frontend/                # 前端（零构建单文件）
-│   ├── index.html           # 页面 + 全部 JS
-│   └── shout-processor.js   # AudioWorklet：多声道下混 + 线性插值重采样 16k
-├── remote/                  # 机器狗板端组件
-│   ├── sayd.py              # 音频播放守护（TCP 18081，帧协议，250ms 缓冲可调）
-│   ├── s10yk-say.service    # 含 ExecStartPre 自动打开 ES8323 输出开关（D-038）
-│   ├── audio_occupancy_check.sh / audio_mic_probe.sh   # 声卡占用/麦克风体检
-│   ├── mic_front.py              # MIC 三路选路前端（OPS-91：3ch 取最强路 + 可选 speex 降噪）
-│   ├── link-probe.sh + *.service/.timer                # 链路探活
-│   ├── ntp/                 # 时钟同步调研与核查脚本
-│   └── *_probe / *_test.py  # 运动/步态/缓冲/抖动等诊断脚本
-├── ros2/
-│   ├── diag/                # ROS2 话题诊断（步态、里程、遥控器、转向标定等）
-│   └── ubeacon/             # UWB 定位（标签驱动见 docs/UWB 报告）
-├── assets/                  # 自定义语音素材 + 清单（人员检测 4 方位预警语音不在此，见部署说明）
-└── docs/                    # 全套过程文档（已脱敏）
-    ├── 需求文档.md            # REQ 台账（至 REQ-049）
-    ├── 技术方案.md            # 总体技术方案（含 §12 语音/喊话/对讲）
-    ├── 版本记录.md            # v1.0 → v3.5 全部版本
-    ├── 缺陷记录.md            # D-001 → D-041（含根因与修复）
-    ├── 操作记录.md            # OPS-001 → OPS-089 可复现命令级操作史
-    ├── 人员检测有效距离分析_20261118.md  # 640@0.45 ≈13~14m → 1280@0.35 ≈30m 的实测依据
-    ├── 服务器移植与网络通讯方案.md
-    ├── 一键喊话_技术方案调研.md / 一键喊话_单向实施方案.md
-    ├── 实现方式审计_话题与硬件.md
-    └── evidence/             # 实测证据（日志、摄像头抓帧）
-```
+## 两版公共文件（任一侧修复必须同步另一侧）
 
-## 快速部署（摘要）
+- `backend/app.py`、`backend/person_detect.py`
+- `frontend/index.html`、`frontend/shout-processor.js`
+- `remote/mic_front.py`、`remote/sayd.py`、`remote/s10yk-say.service`
+- `remote/ntp/`、`docs/缺陷记录.md`
 
-1. **业务板（机器人）**：部署 `remote/sayd.py` 至 `/opt/s10yk/`，安装 `remote/s10yk-say.service` 并 `systemctl enable --now s10yk-say`（单元会自动打开 ES8323 的 Speaker/Headphone 开关——厂商栈弱化后无人打开会导致全静音，见 D-038）。
-2. **云服务器**：
-   - `backend/app.py` → `/opt/s10yk/backend/`，`frontend/` → `/opt/s10yk/frontend/`；
-   - 生成自签证书（**必须含 SAN**，Chrome 只认 SAN）：`openssl req -x509 -newkey rsa:2048 -days 825 -nodes -keyout key.pem -out cert.pem -subj "/CN=s10" -addext "subjectAltName=IP:<服务器IP>,DNS:localhost"`；
-   - systemd 注入 `S10YK_TOKEN`（鉴权 Cookie 密钥）、`S10YK_TLS_CERT/KEY/PORT` 环境变量；
-   - 配置到业务板的 SSH 免密（对讲的下行采集走 `ssh + arecord`）。
-3. **机器人侧网络**：zenoh 7447 放行、NTP 时钟同步、摄像头 RTSP 地址按现场配置。
-4. 访问 `https://<服务器IP>:18443`（麦克风功能需 HTTPS + Chrome）。
+同步方法：修改一侧后复制到另一侧对应路径，两子目录各自验证后一并提交。
 
-> 完整部署步骤、防火墙、证书、踩坑记录：见 [`docs/服务器移植与网络通讯方案.md`](docs/服务器移植与网络通讯方案.md) 与 [`docs/操作记录.md`](docs/操作记录.md)。
+## 文档索引
 
-## 人员检测部署（v3.2+，云服务器 204 侧）
-
-人员检测是独立于控制台后端的服务，**代码在仓库内，但运行资产（模型、预警语音、服务单元）需现场准备**——这三项不在 git 历史中，克隆仓库后必须补齐才能运行：
-
-1. **Python 环境**：204 上建 `/opt/s10yk/venv`，安装 `onnxruntime`、`opencv-python`、`numpy`（约占用 6~8 核；1280 输入 8 线程单帧 ≈190ms，3fps 节流跟得上）。
-2. **检测模型**：默认 `/opt/s10yk/models/yolov8n_1280.onnx`（1280@0.35，有效距离 ≈30m）。可用 `ultralytics` + CPU 版 torch 本地导出 YOLOv8n 的 ONNX（1280 输入），或从现场已导出的模型拷贝；保留 640 模型可随时回退。路径/置信度可用环境变量 `PERSON_MODEL`、`PERSON_CONF` 覆盖，无需改码。依据见 [`docs/人员检测有效距离分析_20261118.md`](docs/人员检测有效距离分析_20261118.md)。
-3. **预警语音**：4 条 16k/mono/s16 WAV，文件名固定为 `person_alert_front.wav`、`person_alert_back.wav`、`person_alert_left.wav`、`person_alert_right.wav`，内容如「注意！前方检测到人员」，可用 piper（`zh_CN-huayan`）合成；放到后端 `S10YK_ASSET_DIR` 指向的目录（默认 `/S10ykRemove/app/assets`，须与 `app.py` 一致）。缺失时预警横幅仍会出现，但不会语音播报。
-4. **服务单元**：仓库未包含 `s10yk-persond.service`，现场按下面模板新建（按实际路径/地址替换占位符）：
-
-   ```ini
-   [Unit]
-   Description=S10YK Person Detection
-   After=network-online.target
-   Wants=network-online.target
-
-   [Service]
-   Type=simple
-   WorkingDirectory=/opt/s10yk/backend
-   Environment=S10YK_RTSP_BASE=rtsp://<ROBOT_IP>:8554
-   ExecStart=/opt/s10yk/venv/bin/python /opt/s10yk/backend/person_detect.py
-   Restart=always
-   RestartSec=5
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-
-   `systemctl daemon-reload && systemctl enable --now s10yk-persond`。
-
-5. **RTSP 可达性**：`S10YK_RTSP_BASE` 必须指向 204 能连通的机器人 RTSP 地址（实测须走 WiFi 同段 `rtsp://<ROBOT_IP>:8554`，内网 `10.21.33.x` 段从 204 不可达）。4 路视频后缀 `video0/2/4/6` 为后/左/前/右视。
-6. **数据目录**：服务自动在 `SAVE_ROOT`（默认 `/opt/s10yk/data/person`）生成 `latest.json`、`stats.json`、`switches.json`、`history.jsonl` 及抓拍图；抓拍保留 2 天、配额按 3 天预估（下限 100MB），超限自动停存并在回落后恢复。控制台后端需为 v3.2+（含 `/api/person/*` 接口与前端「人员检测」页），否则页面不显示。
-
-> 已知限制：检测跑在 204，云链路中断则检测停摆（规划中将推理下沉到机器人 NPU）。完整上线记录见 [`docs/操作记录.md`](docs/操作记录.md) OPS-86~88。
+- 版本记录：`S10ykServer/docs/版本记录.md`（服务器版主线）／`S10ykOnboard/docs/版本记录.md`（落盘主线）
+- 缺陷记录：两子目录 `docs/缺陷记录.md`（保持一致）
+- 整体落盘方案与实施记录：`S10ykOnboard/docs/`
+- 服务器移植与网络通讯方案：`S10ykServer/docs/`
+- 硬件资源占用调研：两子目录 `docs/硬件资源占用调研_20261127.md`
 
 ## 安全说明
 
-- 仓库内文档均为**脱敏副本**：真实密码、服务器/机器人公网 IP、SSH 主机密钥已替换为 `<SERVER_PW>`、`<SERVER_IP>`、`<ROBOT_IP>`、`<HOSTKEY>` 等占位符，部署时按现场实际替换即可；原稿不随仓库分发。
-- 内置公网防护：**v3.5.9** TLS 握手移出 accept 线程（扫描器哑连接不再挂死监听）+ **v3.5.10** 按来源 IP 频率限制（2s 滑动窗口 120 请求，内网/回环豁免，超限 429 断连）。
-- 人员检测的 **ONNX 模型、4 条方位预警语音、`s10yk-persond.service` 单元**属运行时资产，不在仓库内（体积大/现场生成），需按上一节准备。
-- 生产环境建议：改用强随机 `S10YK_TOKEN`、TLS 证书替换自签、7447 限制源地址并启用 zenoh 鉴权。
-
-## 版本快照
-
-- **v3.5.10**：公网来源 IP 频率限制 —— 核实公网通路为防火墙直连（frp 映射已停用），后端可见真实对端 IP；每 IP 2s 滑动窗口 120 请求（环境变量可调），内网/回环豁免，超限 429 + 强制断连（挂载在读 body 之前）；公网 220 并发实测精确 120×200 + 100×429，风暴后业务无中断
-- **v3.5.9**：18443 全站超时根因修复 —— TLS 握手原在 accept 线程同步执行（`wrap_socket(listen_socket)`），公网扫描器连上不发 ClientHello 即挂死 accept（队列堆 111）；改为裸 TCP accept + handler 线程补握手 + 15s 超时 + SSLError 静默，攻击模拟 10 哑连接 + 10 并发 10/10=200
-- **v3.5.5**：双向对讲 `failed to fetch` 故障修复 —— 根因是 HTTPS accept 队列（默认 5）被卡死的 talk/pcm chunked 长流占满，改 `request_queue_size=128`；附带修复 watchdog 无消费者不收麦（改 `no_stream_since` 独立计时）、mic_front.py 滤波系数固化去 scipy 依赖（首帧 3.0s→1.5s）
-- **v3.5.6**：修复手机"无法开始：Failed to fetch" —— `/api/talk/start` 原等首帧最多 3s，公网 HTTPS 链路在等待中断连（请求已到后端、采集已起但响应回不来）；改为立即返回，首帧由 `/api/talk/pcm` 流承载，start 耗时 1.5~3s→**0.004~0.08s**，前端零改动
-- **v3.5.7**：对讲下行 chunked 长流被公网链路掐断（20s 只传 2.7s PCM、手机无声）—— 改为短请求轮询 `GET /api/talk/pcm?ms=200`（与喊话短 POST 同款），吞吐 4.3KB/s→25.7KB/s+，watchdog 无消费者收麦逻辑保留
-- **v3.5.8**：对讲上行拥塞丢片（20s 丢 69 片）—— 日志定量发现上行 POST 泵吞吐 5.5~8.3 片/s < 实时 10 片/s（公网 RTT×小批量）；`SHOUT_BATCH` 4→8、`SHOUT_QMAX` 15→24、重试 2→3 次加退避，泵峰值 10→27 片/s
-- **v3.5.4**：陷波高通滤波上线（L3a，默认开）—— `mic_front.py` 加二阶高通 120Hz + 224/244Hz 双陷波（Q25），语音带 500-3kHz 零损；30cm 定点 A/B：电机基频 −9dB、语音带占全段能量比 8.18%→34.61%（+6.3dB）；speex（L3b）维持默认关，`--no-filter` 一键回退
-- **v3.5.3**：真人语音降噪 A/B —— speex 削语音 74%（SNR 恶化 −7.4dB），L3 维持默认关闭；修正 `mic_front.py` 错位的 speex ctl 常量（非标编号误开 AGC）
-- **v3.5.2**：MIC 三路选路前端（OPS-91）—— 板端 `mic_front.py` 从 6ch 麦阵列前 3 路按帧取最强路（3.2~5.7dB 增益），speex 降噪代码就绪但默认关
-- **v3.5.1**：声卡共用改造 —— 厂商 audio 停用 + sayd 走 pipewire `default`，硬件可多应用并发放音
-- **v3.5**：语音循环叠音根治（D-040，喂流注册表 + 1s 幂等去重 + 前端 800ms 防重入）、后端日志队列化（D-041，先落盘 `/opt/s10yk/logs/backend.log` 再输出，防 journald 停摆拖死业务线程）
-- **v3.4**：人员检测距离升级 640→1280（conf 0.45→0.35、8 推理线程，有效距离 ≈13~14m → ≈30m）
-- **v3.3**：人员检测 4 路摄像头检测开关（POST `/api/person/switch`，状态持久化 `switches.json`）
-- **v3.2**：人员检测一期（REQ-047）+ 人员检测页/抓拍配额（REQ-048）
-- **v3.1.x**：休眠/唤醒两态切换（REQ-042）+ 前进转向组合控制 2s 安全实测（REQ-043，vx 符合标定、vyaw 组合下耦合偏低）+ 圆形八向方向盘支持前进中左右转与恢复直行（REQ-044）、休眠标志跨手柄唤醒自愈（D-040）、移除方向盘下方提示文字（REQ-045）、再次压缩四模块间距（REQ-046）
-- **v3.0.x**：双向对讲（含 MIC 抢占计数）、喊话实时化、上行静音/拥塞/SPK 静音三连修复（D-036/037/038）
-- **v2.7.x**：aplay 缓冲 500ms→250ms（端到端延迟降至 ~0.5s）、TLS 双监听
-- **v2.x**：服务器移植、四路视频、UWB、语音三页签改版
-- **v1.x**：板端直跑版本（运动控制 + 语音播报）
-
-完整历史：[`docs/版本记录.md`](docs/版本记录.md)
+- 本仓库为脱敏仓库：密码、hostkey、公网 IP、UWB ID 等一律以占位符（`<SERVER_PW>`/`<SERVER_IP>`/`<HOSTKEY>` 等）入库；原始档案在本地 `S10ykApp/`（不入库）。
+- 每次同步改动后运行 `tools/sanitize.py`（两子目录各内置，幂等）并做敏感串终扫，确认 0 命中再提交。

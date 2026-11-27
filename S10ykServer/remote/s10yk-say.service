@@ -1,0 +1,24 @@
+# 205 板 /etc/systemd/system/s10yk-say.service（2026-11-26 改为 default/pipewire 共享设备）
+# 与线上文件保持同步；线上备份：~/backup_audio_20261126_134238/
+[Unit]
+Description=S10 custom voice player (sayd) - shared via ALSA default (pipewire)
+After=sound.target
+
+[Service]
+Type=simple
+# 2026-11-26：plughw:0,0 独占设备导致别的应用无法共用；default 走 pipewire 天然混音，
+# 实测 16k/mono 双实例并发 OK（sayd + 另一 aplay 同时 RUNNING）。厂商 audio 已停用。
+Environment=SAYD_ALSA_DEV=default
+Environment=SAYD_PORT=18081
+Environment=SAYD_IDLE=1.2
+# D-038：ES8323 上电默认 Speaker/Headphone 均为 off，厂商环境由 audio_node 负责打开；
+# 我们弱化厂商栈后无人打开 → 播报/喊话全程无声。前缀 "-" 容错（amixer 失败不阻塞 sayd 启动）。
+ExecStartPre=-/usr/bin/amixer -c 0 sset Speaker on
+ExecStartPre=-/usr/bin/amixer -c 0 sset Headphone on
+ExecStartPre=-/usr/bin/amixer -c 0 sset PCM 192
+ExecStart=/usr/bin/python3 /opt/s10yk/sayd.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

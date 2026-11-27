@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份文件（本项目迭代过程中的 .bak.* 均不入库）
+*.bak
+*.bak.*
+
+# 证书与密钥
+*.pem
+*.key
+*.crt
+certs/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 临时产物
+*.log.tmp
+.tmp/
