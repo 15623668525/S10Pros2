@@ -46,7 +46,7 @@ try:
 except Exception:
     StdStatus = None
 
-AUDIO_YAML = "/opt/robot/share/robot_drivers/audio_node_assets/audio.yaml"
+AUDIO_YAML = os.environ.get("S10YK_AUDIO_YAML", "/opt/robot/share/robot_drivers/audio_node_assets/audio.yaml")
 FRONTEND = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html"))
 PRESET_DUR = {}   # {audio_id: 时长 ms}，前端据此在单次播放结束后自动取消框选
 
